@@ -216,4 +216,12 @@ Dataset Dataset::open(const std::string& path) {
     return Dataset{std::move(layers)};
 }
 
+Envelope Dataset::extent() const {
+    Envelope extent;
+    for (const Layer& layer : layers_) {
+        extent.expand(layer.extent());
+    }
+    return extent;
+}
+
 }  // namespace cartograph

@@ -3,6 +3,8 @@ find_package(Catch2 CONFIG REQUIRED)
 add_executable(cartograph_core_tests
     test_geometry.cpp
     test_dataset.cpp
+    test_viewport.cpp
+    test_render.cpp
 )
 
 target_link_libraries(cartograph_core_tests PRIVATE Cartograph::Core Catch2::Catch2WithMain)

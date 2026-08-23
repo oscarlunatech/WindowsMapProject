@@ -1,12 +1,17 @@
 #include <cstdlib>
 #include <format>
 #include <iostream>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <variant>
+#include <vector>
 
 #include "cartograph/dataset.h"
+#include "cartograph/render/renderer.h"
 
 using namespace cartograph;
 
@@ -64,11 +69,46 @@ int runDump(const std::string& path, std::size_t limit) {
     return 0;
 }
 
+Envelope parseBBox(const std::string& text) {
+    std::vector<double> values;
+    std::stringstream ss(text);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        values.push_back(std::stod(token));
+    }
+    if (values.size() != 4) {
+        throw std::invalid_argument("--bbox must be minX,minY,maxX,maxY");
+    }
+    Envelope bbox;
+    bbox.expand(Point2D{values[0], values[1]});
+    bbox.expand(Point2D{values[2], values[3]});
+    return bbox;
+}
+
+render::ScreenSize parseSize(const std::string& text) {
+    const auto xPos = text.find('x');
+    if (xPos == std::string::npos) {
+        throw std::invalid_argument("--size must be WIDTHxHEIGHT");
+    }
+    return render::ScreenSize{std::stoi(text.substr(0, xPos)), std::stoi(text.substr(xPos + 1))};
+}
+
+int runRender(const std::string& path, const std::optional<Envelope>& bboxOverride,
+              render::ScreenSize size, const std::string& outputPath) {
+    const Dataset dataset = Dataset::open(path);
+    const Envelope bbox = bboxOverride ? *bboxOverride : dataset.extent();
+    const render::Viewport viewport(bbox, size);
+    const auto bitmap = render::Renderer::render(dataset, viewport);
+    render::savePng(bitmap.Get(), outputPath);
+    return 0;
+}
+
 void printUsage(const char* argv0) {
     std::cerr << std::format(
         "usage: {} info <path>\n"
-        "       {} dump <path> [--limit N]\n",
-        argv0, argv0);
+        "       {} dump <path> [--limit N]\n"
+        "       {} render <path> [--bbox minX,minY,maxX,maxY] [--size WxH] -o <output.png>\n",
+        argv0, argv0, argv0);
 }
 
 }  // namespace
@@ -96,7 +136,27 @@ int main(int argc, char** argv) {
             }
             return runDump(path, limit);
         }
-    } catch (const DatasetOpenError& e) {
+        if (command == "render") {
+            std::optional<Envelope> bbox;
+            render::ScreenSize size{1024, 768};
+            std::string output;
+            for (int i = 3; i < argc; ++i) {
+                const std::string_view arg = argv[i];
+                if (arg == "--bbox" && i + 1 < argc) {
+                    bbox = parseBBox(argv[++i]);
+                } else if (arg == "--size" && i + 1 < argc) {
+                    size = parseSize(argv[++i]);
+                } else if (arg == "-o" && i + 1 < argc) {
+                    output = argv[++i];
+                }
+            }
+            if (output.empty()) {
+                std::cerr << "error: -o <output.png> is required\n";
+                return 1;
+            }
+            return runRender(path, bbox, size, output);
+        }
+    } catch (const std::exception& e) {
         std::cerr << std::format("error: {}\n", e.what());
         return 1;
     }

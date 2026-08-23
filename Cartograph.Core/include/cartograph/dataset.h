@@ -23,6 +23,9 @@ public:
 
     const std::vector<Layer>& layers() const { return layers_; }
 
+    // Union of every layer's extent.
+    Envelope extent() const;
+
 private:
     explicit Dataset(std::vector<Layer> layers) : layers_(std::move(layers)) {}
 

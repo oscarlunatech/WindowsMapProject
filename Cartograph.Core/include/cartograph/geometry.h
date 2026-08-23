@@ -35,6 +35,9 @@ struct Envelope {
 
     void expand(const Point2D& point);
     void expand(const Envelope& other);
+
+    double width() const { return maxX - minX; }
+    double height() const { return maxY - minY; }
 };
 
 class Geometry {
