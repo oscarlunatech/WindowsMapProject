@@ -32,7 +32,7 @@ build\x64-debug\Cartograph.Core\tests\cartograph_core_tests.exe [render]
 build\x64-debug\Cartograph.Core\tests\cartograph_core_tests.exe "Envelope expands to cover points"
 ```
 
-Run the CLI: `build\x64-debug\cartograph_cli.exe {info|dump|render|view} <path> ...` — see README's Usage section for flags.
+Run the CLI: `build\x64-debug\cartograph_cli.exe {info|dump|render|view|bench} <path> ...` — see README's Usage section for flags.
 
 ## Architecture
 
@@ -43,7 +43,7 @@ Run the CLI: `build\x64-debug\cartograph_cli.exe {info|dump|render|view} <path> 
 **Data flow through Core**, in the order a new dataset moves through the code:
 1. `Dataset::open()` (`Cartograph.Core/src/dataset.cpp`) is the *only* file that includes GDAL/OGR headers. It converts every `OGRFeature`/`OGRGeometry` into Core's own `Feature`/`Geometry` on ingest and closes the GDAL dataset before returning — no OGR pointer ever survives past this call. Throws `DatasetOpenError` (not a null-return) on failure.
 2. `Geometry` (`include/cartograph/geometry.h`) is intentionally data-oriented, not a class hierarchy: `parts()` returns `vector<Part>`, where a `Part` is `vector<Ring>` (exterior + holes for a polygon, one ring for a line/point). This shape is what both GEOS interop (future) and D2D path-building (`renderer.cpp`) want directly.
-3. `render::Viewport` (`render/viewport.h`) does the aspect-ratio-preserving, Y-flipped map↔screen transform. It's an immutable value constructed fresh from `(mapExtent, screenSize)` whenever either changes — `Viewer` (the live window) doesn't mutate a Viewport, it rebuilds one every frame from its own mutable `mapExtent_`.
+3. `render::Viewport` (`render/viewport.h`) does the Y-flipped map↔screen transform with a uniform (non-distorting) scale. It's an immutable value constructed fresh from `(mapExtent, screenSize)` whenever either changes — `Viewer` (the live window) doesn't mutate a Viewport, it rebuilds one every frame from its own mutable `mapExtent_`. Rather than letterboxing/pillarboxing when the window's aspect ratio doesn't match `mapExtent`'s, the constructor grows `mapExtent` about its own center along whichever axis is narrower, so the map always fills the whole screen — `Viewport::mapExtent()` therefore returns the *displayed* extent, which can be wider or taller than what was passed in.
 4. `render::drawDataset(ID2D1RenderTarget&, ID2D1Factory&, ...)` (`render/renderer.h`) is the unculled, unbatched drawing entry point — `Renderer::render` (off-screen, WIC-backed, forces `D2D1_RENDER_TARGET_TYPE_SOFTWARE` for deterministic golden-image tests) calls it and is *never* touched by performance work, on purpose (see the Phase 4 DECISIONS.md entry) — that keeps the golden-image test permanently unaffected by anything downstream.
 5. `render::drawDatasetCulled(...)` is the fast path: `Viewer::onPaint` (live) and `bench --culled` both call it with a `vector<render::LayerCache>` (one per `dataset.layers()`, built once at startup/before the timed loop). Each `LayerCache` bundles an `index::SpatialIndex` (bulk-loaded `boost::geometry::index::rtree`, hidden behind a pimpl so boost never appears in a public header) for viewport culling, plus `geom::simplify`'d geometry precomputed at a handful of zoom-level tolerance buckets. `drawDatasetCulled` also batches every visible layer's lines/polygons into one `ID2D1PathGeometry` and one draw call each, instead of one per feature. See `BENCHMARKS.md` for the before/after numbers this produced on the real NJ TIGER roads dataset (`scripts/fetch-data.ps1`, gitignored `data/`).
 
