@@ -12,6 +12,7 @@
 
 #include "cartograph/dataset.h"
 #include "cartograph/render/renderer.h"
+#include "viewer.h"
 
 using namespace cartograph;
 
@@ -103,12 +104,21 @@ int runRender(const std::string& path, const std::optional<Envelope>& bboxOverri
     return 0;
 }
 
+int runView(const std::string& path) {
+    Dataset dataset = Dataset::open(path);
+    const Envelope extent = dataset.extent();
+    Viewer viewer(std::move(dataset), extent);
+    viewer.run();
+    return 0;
+}
+
 void printUsage(const char* argv0) {
     std::cerr << std::format(
         "usage: {} info <path>\n"
         "       {} dump <path> [--limit N]\n"
-        "       {} render <path> [--bbox minX,minY,maxX,maxY] [--size WxH] -o <output.png>\n",
-        argv0, argv0, argv0);
+        "       {} render <path> [--bbox minX,minY,maxX,maxY] [--size WxH] -o <output.png>\n"
+        "       {} view <path>\n",
+        argv0, argv0, argv0, argv0);
 }
 
 }  // namespace
@@ -155,6 +165,9 @@ int main(int argc, char** argv) {
                 return 1;
             }
             return runRender(path, bbox, size, output);
+        }
+        if (command == "view") {
+            return runView(path);
         }
     } catch (const std::exception& e) {
         std::cerr << std::format("error: {}\n", e.what());

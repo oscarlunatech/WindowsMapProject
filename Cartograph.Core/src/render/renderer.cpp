@@ -144,6 +144,16 @@ void drawFeature(ID2D1Factory& factory, ID2D1RenderTarget& target, const Viewpor
 
 }  // namespace
 
+void drawDataset(ID2D1RenderTarget& target, ID2D1Factory& factory, const Dataset& dataset,
+                  const Viewport& viewport) {
+    const Brushes brushes = createBrushes(target);
+    for (const Layer& layer : dataset.layers()) {
+        for (const Feature& feature : layer.features()) {
+            drawFeature(factory, target, viewport, brushes, feature);
+        }
+    }
+}
+
 ComPtr<IWICBitmap> Renderer::render(const Dataset& dataset, const Viewport& viewport) {
     const ComPtr<IWICImagingFactory> wicFactory = createWicFactory();
 
@@ -166,17 +176,9 @@ ComPtr<IWICBitmap> Renderer::render(const Dataset& dataset, const Viewport& view
     throwIfFailed(d2dFactory->CreateWicBitmapRenderTarget(wicBitmap.Get(), props, &renderTarget),
                   "CreateWicBitmapRenderTarget");
 
-    const Brushes brushes = createBrushes(*renderTarget.Get());
-
     renderTarget->BeginDraw();
     renderTarget->Clear(D2D1::ColorF(D2D1::ColorF::White));
-
-    for (const Layer& layer : dataset.layers()) {
-        for (const Feature& feature : layer.features()) {
-            drawFeature(*d2dFactory.Get(), *renderTarget.Get(), viewport, brushes, feature);
-        }
-    }
-
+    drawDataset(*renderTarget.Get(), *d2dFactory.Get(), dataset, viewport);
     throwIfFailed(renderTarget->EndDraw(), "ID2D1RenderTarget::EndDraw");
 
     return wicBitmap;
