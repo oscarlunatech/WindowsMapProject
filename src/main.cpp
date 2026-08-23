@@ -1,59 +1,106 @@
+#include <cstdlib>
 #include <format>
 #include <iostream>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <variant>
 
-#include <cpl_conv.h>
-#include <gdal_priv.h>
-#include <ogrsf_frmts.h>
+#include "cartograph/dataset.h"
 
-int main(int argc, char** argv) {
-    if (argc != 2) {
-        std::cerr << std::format("usage: {} <path-to-vector-dataset>\n", argv[0]);
-        return 1;
-    }
+using namespace cartograph;
 
-    // proj.db ships next to the executable (see CMakeLists.txt); PROJ doesn't
-    // discover it there on its own.
-    char exePath[1024];
-    if (CPLGetExecPath(exePath, sizeof(exePath))) {
-        CPLSetConfigOption("PROJ_DATA", CPLGetDirname(exePath));
-    }
+namespace {
 
-    GDALAllRegister();
+std::string formatAttribute(const AttributeValue& value) {
+    return std::visit(
+        [](const auto& v) -> std::string {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, std::monostate>) {
+                return "(null)";
+            } else if constexpr (std::is_same_v<T, std::string>) {
+                return v;
+            } else {
+                return std::format("{}", v);
+            }
+        },
+        value);
+}
 
-    GDALDataset* dataset = static_cast<GDALDataset*>(
-        GDALOpenEx(argv[1], GDAL_OF_VECTOR, nullptr, nullptr, nullptr));
-    if (dataset == nullptr) {
-        std::cerr << std::format("failed to open '{}'\n", argv[1]);
-        return 1;
-    }
-
-    for (OGRLayer* layer : dataset->GetLayers()) {
-        OGREnvelope extent;
-        if (layer->GetExtent(&extent) != OGRERR_NONE) {
-            extent = {};
-        }
-
-        const OGRSpatialReference* srs = layer->GetSpatialRef();
-        char* wkt = nullptr;
-        if (srs != nullptr) {
-            srs->exportToPrettyWkt(&wkt);
-        }
-
+int runInfo(const std::string& path) {
+    const Dataset dataset = Dataset::open(path);
+    for (const Layer& layer : dataset.layers()) {
+        const Envelope& extent = layer.extent();
         std::cout << std::format(
             "layer: {}\n"
             "  features: {}\n"
             "  extent: [{}, {}] x [{}, {}]\n"
             "  crs: {}\n",
-            layer->GetName(),
-            layer->GetFeatureCount(),
-            extent.MinX, extent.MaxX, extent.MinY, extent.MaxY,
-            wkt != nullptr ? wkt : "(none)");
+            layer.name(), layer.features().size(), extent.minX, extent.maxX, extent.minY,
+            extent.maxY, layer.crsWkt().empty() ? "(none)" : layer.crsWkt());
+    }
+    return 0;
+}
 
-        if (wkt != nullptr) {
-            CPLFree(wkt);
+int runDump(const std::string& path, std::size_t limit) {
+    const Dataset dataset = Dataset::open(path);
+    for (const Layer& layer : dataset.layers()) {
+        std::cout << std::format("layer: {}\n", layer.name());
+        const auto& fields = layer.fields();
+
+        std::size_t count = 0;
+        for (const Feature& feature : layer.features()) {
+            if (count >= limit) {
+                break;
+            }
+            std::cout << std::format("  feature {}:\n", feature.id());
+            const auto& attributes = feature.attributes();
+            for (std::size_t i = 0; i < fields.size(); ++i) {
+                std::cout << std::format("    {}: {}\n", fields[i].name, formatAttribute(attributes[i]));
+            }
+            ++count;
         }
     }
-
-    GDALClose(dataset);
     return 0;
+}
+
+void printUsage(const char* argv0) {
+    std::cerr << std::format(
+        "usage: {} info <path>\n"
+        "       {} dump <path> [--limit N]\n",
+        argv0, argv0);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    if (argc < 3) {
+        printUsage(argv[0]);
+        return 1;
+    }
+
+    const std::string command = argv[1];
+    const std::string path = argv[2];
+
+    try {
+        if (command == "info") {
+            return runInfo(path);
+        }
+        if (command == "dump") {
+            std::size_t limit = 10;
+            for (int i = 3; i < argc; ++i) {
+                const std::string_view arg = argv[i];
+                if (arg == "--limit" && i + 1 < argc) {
+                    limit = static_cast<std::size_t>(std::strtoul(argv[++i], nullptr, 10));
+                }
+            }
+            return runDump(path, limit);
+        }
+    } catch (const DatasetOpenError& e) {
+        std::cerr << std::format("error: {}\n", e.what());
+        return 1;
+    }
+
+    printUsage(argv[0]);
+    return 1;
 }

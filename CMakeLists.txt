@@ -4,10 +4,14 @@ project(Cartograph LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+include(CTest)
+
 find_package(GDAL CONFIG REQUIRED)
 
+add_subdirectory(Cartograph.Core)
+
 add_executable(cartograph_cli src/main.cpp)
-target_link_libraries(cartograph_cli PRIVATE GDAL::GDAL)
+target_link_libraries(cartograph_cli PRIVATE Cartograph::Core)
 
 # PROJ needs proj.db at runtime for coordinate transforms; it doesn't get
 # copied alongside the DLLs by vcpkg's applocal step like the binaries do.
