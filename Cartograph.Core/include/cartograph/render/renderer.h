@@ -1,13 +1,16 @@
 #pragma once
 
+#include <cstddef>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <d2d1.h>
 #include <wincodec.h>
 #include <wrl/client.h>
 
 #include "cartograph/dataset.h"
+#include "cartograph/render/layer_cache.h"
 #include "cartograph/render/viewport.h"
 
 namespace cartograph::render {
@@ -24,6 +27,39 @@ public:
 // placeholder until Phase 7 introduces real symbology.
 void drawDataset(ID2D1RenderTarget& target, ID2D1Factory& factory, const Dataset& dataset,
                   const Viewport& viewport);
+
+// Like drawDataset, but culls each layer against its LayerCache's spatial
+// index (only features intersecting the viewport are drawn), draws
+// per-zoom-level-simplified geometry instead of the original, and batches
+// every visible line/polygon per layer into one ID2D1PathGeometry each
+// instead of one draw call per feature. layerCaches must be the same size
+// as dataset.layers(), one entry per layer in order. Returns the total
+// number of features actually drawn (for a "features drawn"/"culled"
+// overlay - see Viewer::onPaint).
+std::size_t drawDatasetCulled(ID2D1RenderTarget& target, ID2D1Factory& factory, const Dataset& dataset,
+                               const std::vector<LayerCache>& layerCaches, const Viewport& viewport);
+
+// A reusable off-screen D2D render target backed by a WIC bitmap, forcing
+// the software (WARP) rasterizer for reproducibility. Exists so repeated
+// draws (e.g. the benchmark harness timing many frames) pay render-target
+// setup cost once, not per frame - Renderer::render is a thin wrapper
+// around a single beginFrame/drawDataset/endFrame cycle.
+class OffscreenTarget {
+public:
+    explicit OffscreenTarget(ScreenSize size);
+
+    ID2D1RenderTarget& renderTarget() { return *renderTarget_.Get(); }
+    ID2D1Factory& factory() { return *d2dFactory_.Get(); }
+    Microsoft::WRL::ComPtr<IWICBitmap> bitmap() const { return wicBitmap_; }
+
+    void beginFrame();
+    void endFrame();  // throws RenderError if EndDraw fails
+
+private:
+    Microsoft::WRL::ComPtr<IWICBitmap> wicBitmap_;
+    Microsoft::WRL::ComPtr<ID2D1Factory> d2dFactory_;
+    Microsoft::WRL::ComPtr<ID2D1RenderTarget> renderTarget_;
+};
 
 class Renderer {
 public:

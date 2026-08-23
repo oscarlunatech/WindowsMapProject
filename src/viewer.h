@@ -6,14 +6,18 @@
 #include <dwrite.h>
 #include <wrl/client.h>
 
+#include <vector>
+
 #include "cartograph/dataset.h"
+#include "cartograph/render/layer_cache.h"
 #include "cartograph/render/viewport.h"
 
 // Opens a live Win32 window rendering a Dataset with mouse pan, scroll-wheel
 // zoom, keyboard nav, and a frame-timing overlay. Deliberately outside
 // Cartograph.Core - the core knows nothing about windows or message loops;
-// it only supplies drawDataset() (see cartograph/render/renderer.h), which
-// this class calls into every frame.
+// it only supplies drawDatasetCulled() (see cartograph/render/renderer.h),
+// which this class calls into every frame using a LayerCache built once per
+// layer at startup.
 class Viewer {
 public:
     Viewer(cartograph::Dataset dataset, cartograph::Envelope initialExtent);
@@ -36,6 +40,7 @@ private:
 
     cartograph::Dataset dataset_;
     std::size_t totalFeatureCount_ = 0;
+    std::vector<cartograph::render::LayerCache> layerCaches_;  // one per dataset_.layers(), built once
     cartograph::Envelope mapExtent_;
     cartograph::render::ScreenSize screenSize_{1024, 768};
 

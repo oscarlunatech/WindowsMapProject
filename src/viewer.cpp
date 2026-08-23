@@ -33,8 +33,10 @@ constexpr wchar_t kWindowClassName[] = L"CartographViewerWindowClass";
 
 Viewer::Viewer(Dataset dataset, Envelope initialExtent)
     : dataset_(std::move(dataset)), mapExtent_(initialExtent) {
+    layerCaches_.reserve(dataset_.layers().size());
     for (const auto& layer : dataset_.layers()) {
         totalFeatureCount_ += layer.features().size();
+        layerCaches_.emplace_back(layer);
     }
 }
 
@@ -173,16 +175,16 @@ void Viewer::onPaint(HWND hwnd) {
 
     renderTarget_->BeginDraw();
     renderTarget_->Clear(D2D1::ColorF(D2D1::ColorF::White));
-    cartograph::render::drawDataset(*renderTarget_.Get(), *d2dFactory_.Get(), dataset_, currentViewport());
+    const std::size_t drawnCount = cartograph::render::drawDatasetCulled(
+        *renderTarget_.Get(), *d2dFactory_.Get(), dataset_, layerCaches_, currentViewport());
 
     QueryPerformanceCounter(&end);
     const double ms =
         1000.0 * static_cast<double>(end.QuadPart - start.QuadPart) / static_cast<double>(freq.QuadPart);
 
-    // No spatial index yet (that's Phase 4), so every feature is drawn every
-    // frame and nothing is culled - this overlay is the "before" baseline.
     wchar_t overlay[256];
-    swprintf_s(overlay, L"ms/frame: %.2f   features drawn: %zu   culled: 0", ms, totalFeatureCount_);
+    swprintf_s(overlay, L"ms/frame: %.2f   features drawn: %zu   culled: %zu", ms, drawnCount,
+               totalFeatureCount_ - drawnCount);
     const D2D1_RECT_F layoutRect =
         D2D1::RectF(8.0f, 8.0f, static_cast<float>(screenSize_.width) - 8.0f, 32.0f);
     renderTarget_->DrawText(overlay, static_cast<UINT32>(wcslen(overlay)), textFormat_.Get(), layoutRect,

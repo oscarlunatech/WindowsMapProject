@@ -1,5 +1,7 @@
 build/
 out/
+data/
+bench_*.csv
 .vs/
 .vscode/*
 !.vscode/settings.json

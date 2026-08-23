@@ -2,7 +2,7 @@
 
 A narrow, fast, correct desktop GIS viewer for Windows. C++ core, WPF shell.
 
-Status: **Phase 3 (live window) complete.** Phase 4 (make it fast) is next. See [DECISIONS.md](DECISIONS.md) and [BENCHMARKS.md](BENCHMARKS.md) for the running log.
+Status: **Phase 4 (make it fast) complete.** Phase 5 (threading) is next. See [DECISIONS.md](DECISIONS.md) and [BENCHMARKS.md](BENCHMARKS.md) for the running log.
 
 ## Design goals
 
@@ -42,9 +42,10 @@ cartograph_cli info <path>
 cartograph_cli dump <path> [--limit N]
 cartograph_cli render <path> [--bbox minX,minY,maxX,maxY] [--size WxH] -o <output.png>
 cartograph_cli view <path>
+cartograph_cli bench <path> [--frames N] [--culled] [-o results.csv]
 ```
 
-`info`/`dump` print layer metadata and feature attributes. `render` draws a dataset to a PNG with no window (used for the golden-image tests). `view` opens a live window: left-drag to pan, scroll wheel to zoom under the cursor, arrow keys to pan, `+`/`-` to zoom.
+`info`/`dump` print layer metadata and feature attributes. `render` draws a dataset to a PNG with no window (used for the golden-image tests). `view` opens a live window: left-drag to pan, scroll wheel to zoom under the cursor, arrow keys to pan, `+`/`-` to zoom. `bench` times a fixed camera path over a dataset and writes per-frame ms to a CSV — pass `--culled` to exercise the indexed/simplified/batched draw path instead of the naive one (see BENCHMARKS.md).
 
 ## Explicitly out of scope
 

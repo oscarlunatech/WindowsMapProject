@@ -22,6 +22,9 @@ public:
     const Envelope& mapExtent() const { return mapExtent_; }
     ScreenSize screenSize() const { return screenSize_; }
 
+    // Screen pixels per map unit (uniform - aspect ratio is preserved).
+    double scale() const { return scale_; }
+
 private:
     Envelope mapExtent_;
     ScreenSize screenSize_;

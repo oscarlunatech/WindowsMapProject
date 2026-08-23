@@ -26,7 +26,7 @@ cmake --build --preset x64-debug
 ctest --preset x64-debug          # or run the test exe directly, see below
 ```
 
-Single test / filtered run (Catch2 tags, e.g. `[render]`, `[dataset]`, `[geometry]`, `[viewport]`):
+Single test / filtered run (Catch2 tags, e.g. `[render]`, `[dataset]`, `[geometry]`, `[viewport]`, `[index]`, `[simplify]`, `[layer_cache]`):
 ```
 build\x64-debug\Cartograph.Core\tests\cartograph_core_tests.exe [render]
 build\x64-debug\Cartograph.Core\tests\cartograph_core_tests.exe "Envelope expands to cover points"
@@ -44,7 +44,8 @@ Run the CLI: `build\x64-debug\cartograph_cli.exe {info|dump|render|view} <path> 
 1. `Dataset::open()` (`Cartograph.Core/src/dataset.cpp`) is the *only* file that includes GDAL/OGR headers. It converts every `OGRFeature`/`OGRGeometry` into Core's own `Feature`/`Geometry` on ingest and closes the GDAL dataset before returning — no OGR pointer ever survives past this call. Throws `DatasetOpenError` (not a null-return) on failure.
 2. `Geometry` (`include/cartograph/geometry.h`) is intentionally data-oriented, not a class hierarchy: `parts()` returns `vector<Part>`, where a `Part` is `vector<Ring>` (exterior + holes for a polygon, one ring for a line/point). This shape is what both GEOS interop (future) and D2D path-building (`renderer.cpp`) want directly.
 3. `render::Viewport` (`render/viewport.h`) does the aspect-ratio-preserving, Y-flipped map↔screen transform. It's an immutable value constructed fresh from `(mapExtent, screenSize)` whenever either changes — `Viewer` (the live window) doesn't mutate a Viewport, it rebuilds one every frame from its own mutable `mapExtent_`.
-4. `render::drawDataset(ID2D1RenderTarget&, ID2D1Factory&, ...)` (`render/renderer.h`) is the single shared drawing entry point — both `Renderer::render` (off-screen, WIC-backed, forces `D2D1_RENDER_TARGET_TYPE_SOFTWARE` for deterministic golden-image tests) and `Viewer::onPaint` (live, hardware-backed `HwndRenderTarget`, for a realistic frame-time baseline) call into it, so brush/path-building logic exists exactly once.
+4. `render::drawDataset(ID2D1RenderTarget&, ID2D1Factory&, ...)` (`render/renderer.h`) is the unculled, unbatched drawing entry point — `Renderer::render` (off-screen, WIC-backed, forces `D2D1_RENDER_TARGET_TYPE_SOFTWARE` for deterministic golden-image tests) calls it and is *never* touched by performance work, on purpose (see the Phase 4 DECISIONS.md entry) — that keeps the golden-image test permanently unaffected by anything downstream.
+5. `render::drawDatasetCulled(...)` is the fast path: `Viewer::onPaint` (live) and `bench --culled` both call it with a `vector<render::LayerCache>` (one per `dataset.layers()`, built once at startup/before the timed loop). Each `LayerCache` bundles an `index::SpatialIndex` (bulk-loaded `boost::geometry::index::rtree`, hidden behind a pimpl so boost never appears in a public header) for viewport culling, plus `geom::simplify`'d geometry precomputed at a handful of zoom-level tolerance buckets. `drawDatasetCulled` also batches every visible layer's lines/polygons into one `ID2D1PathGeometry` and one draw call each, instead of one per feature. See `BENCHMARKS.md` for the before/after numbers this produced on the real NJ TIGER roads dataset (`scripts/fetch-data.ps1`, gitignored `data/`).
 
 **Error handling convention**: exceptions at system boundaries (file I/O, COM/D2D/WIC failures, CLI argument parsing), not error codes — `DatasetOpenError` and `RenderError` both derive from `std::runtime_error`; `main()` catches `const std::exception&` once at the top rather than per exception type.
 
@@ -54,8 +55,5 @@ Run the CLI: `build\x64-debug\cartograph_cli.exe {info|dump|render|view} <path> 
 
 Catch2, `Cartograph.Core/tests/`. Two things worth knowing before adding tests:
 - `test_render.cpp` does a **byte-exact** pixel comparison against a committed golden PNG (`tests/fixtures/golden/countries_world.png`), relying on the forced software rasterizer for determinism. See the DECISIONS.md entry on this — it's an accepted risk (unverified across machines/CI), not an oversight, so don't "fix" apparent flakiness here by loosening it without updating that entry.
-- Fixture data (`tests/fixtures/ne_110m_admin_0_countries.*`) is Natural Earth 110m data, small enough to commit directly (per README's test-data tier table). Larger benchmarking datasets (TIGER roads, OSM extracts) must never be committed — they're fetched by a script, not checked in (that script doesn't exist yet; it lands whenever Phase 4 needs the large dataset).
+- Fixture data (`tests/fixtures/ne_110m_admin_0_countries.*`) is Natural Earth 110m data, small enough to commit directly (per README's test-data tier table). Larger benchmarking datasets must never be committed: `scripts/fetch-data.ps1` downloads NJ TIGER/Line roads (21 counties) into gitignored `data/nj-roads/` — rerun it rather than expecting that data to already be present on a fresh clone.
 
-## Git
-
-Commit messages in this repo do not get a `Co-Authored-By: Claude` trailer — this was requested explicitly and applies to all commits here, not just the first few.

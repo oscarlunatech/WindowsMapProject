@@ -21,3 +21,15 @@ PROJ doesn't discover `proj.db` next to the exe on Windows by default, and vcpkg
 `test_render.cpp` requires the freshly rendered bitmap to exactly match the committed golden PNG, no per-pixel tolerance. This only works because rendering forces `D2D1_RENDER_TARGET_TYPE_SOFTWARE` (WARP), which should be deterministic regardless of the local GPU/driver.
 
 Risk: this session only has one machine to test on, so cross-machine/CI determinism (different Windows or D2D versions producing slightly different antialiasing) is unverified. Chose exact matching anyway rather than building a tolerance-based comparison up front for a flakiness problem that hasn't actually been observed yet. Revisit with a per-pixel-tolerance + mismatch-percentage comparison if CI proves the exact match too brittle.
+
+## 2026-08-23 — hand-rolled Douglas-Peucker instead of GEOS
+
+`geom::simplify` (`Cartograph.Core/src/geom/simplify.cpp`) implements Ramer-Douglas-Peucker directly rather than calling GEOS (`geos::simplify::DouglasPeuckerSimplifier`), even though GEOS is already a dependency and is the project's designated geometry-algorithms library.
+
+Douglas-Peucker is a simple, well-defined recursive algorithm over a flat point list, unit-tested directly against hand-computed expected output. That's a different category from the "never write your own datum math" rule for reprojection (Phase 6) — that rule is about subtle, hard-to-verify correctness (datum shifts, edge-of-domain behavior) where a wrong answer can look plausible. A wrong Douglas-Peucker implementation is easy to catch with a handful of known-distance test cases, which `test_simplify.cpp` does. Would revisit if the outline's later geometry work (buffer, intersect, validity) needs GEOS integration anyway, at which point routing simplification through GEOS too might reduce total surface area rather than add it.
+
+## 2026-08-23 — Phase 4 optimizations only touch the live Viewer, not Renderer::render
+
+`SpatialIndex`/`LayerCache`/`drawDatasetCulled` are wired into `Viewer` (`src/viewer.cpp`) and the `bench` CLI subcommand, but `Renderer::render` (the off-screen, golden-image-tested path) still calls the original, unculled `drawDataset` unchanged.
+
+Deliberate: the performance problem Phase 4 solves is specifically live pan/zoom frame time, not one-shot file rendering, and leaving `Renderer::render` untouched meant the Phase 2 golden-image test needed zero changes or re-baselining through this entire phase (verified: `test_render.cpp` passed unmodified before, during, and after all Phase 4 work). If a future phase wants a culled/batched off-screen render path (e.g. for faster large-area exports), it should reuse `drawDatasetCulled` directly rather than growing `Renderer::render` a mode flag.

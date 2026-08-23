@@ -52,13 +52,14 @@ D2D1_POINT_2F toD2DPoint(Point2D p) {
     return D2D1::Point2F(static_cast<float>(p.x), static_cast<float>(p.y));
 }
 
-// One figure per ring; filled+closed for polygons, hollow+open for lines.
-// Fill mode is alternate so polygon holes render correctly regardless of
-// ring winding order.
-ComPtr<ID2D1PathGeometry> buildPathGeometry(ID2D1Factory* factory, const Viewport& viewport,
-                                             const Geometry& geometry, bool filled) {
+// One figure per ring per geometry; filled+closed for polygons, hollow+open
+// for lines. Fill mode is alternate so polygon holes render correctly
+// regardless of ring winding order. Takes multiple geometries so callers can
+// batch many features into one ID2D1PathGeometry and one draw call.
+ComPtr<ID2D1PathGeometry> buildPathGeometry(ID2D1Factory& factory, const Viewport& viewport,
+                                             const std::vector<const Geometry*>& geometries, bool filled) {
     ComPtr<ID2D1PathGeometry> path;
-    throwIfFailed(factory->CreatePathGeometry(&path), "CreatePathGeometry");
+    throwIfFailed(factory.CreatePathGeometry(&path), "CreatePathGeometry");
 
     ComPtr<ID2D1GeometrySink> sink;
     throwIfFailed(path->Open(&sink), "ID2D1PathGeometry::Open");
@@ -67,21 +68,28 @@ ComPtr<ID2D1PathGeometry> buildPathGeometry(ID2D1Factory* factory, const Viewpor
     const D2D1_FIGURE_BEGIN beginMode = filled ? D2D1_FIGURE_BEGIN_FILLED : D2D1_FIGURE_BEGIN_HOLLOW;
     const D2D1_FIGURE_END endMode = filled ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN;
 
-    for (const Part& part : geometry.parts()) {
-        for (const Ring& ring : part) {
-            if (ring.empty()) {
-                continue;
+    for (const Geometry* geometry : geometries) {
+        for (const Part& part : geometry->parts()) {
+            for (const Ring& ring : part) {
+                if (ring.empty()) {
+                    continue;
+                }
+                sink->BeginFigure(toD2DPoint(viewport.mapToScreen(ring.front())), beginMode);
+                for (std::size_t i = 1; i < ring.size(); ++i) {
+                    sink->AddLine(toD2DPoint(viewport.mapToScreen(ring[i])));
+                }
+                sink->EndFigure(endMode);
             }
-            sink->BeginFigure(toD2DPoint(viewport.mapToScreen(ring.front())), beginMode);
-            for (std::size_t i = 1; i < ring.size(); ++i) {
-                sink->AddLine(toD2DPoint(viewport.mapToScreen(ring[i])));
-            }
-            sink->EndFigure(endMode);
         }
     }
 
     throwIfFailed(sink->Close(), "ID2D1GeometrySink::Close");
     return path;
+}
+
+ComPtr<ID2D1PathGeometry> buildPathGeometry(ID2D1Factory& factory, const Viewport& viewport,
+                                             const Geometry& geometry, bool filled) {
+    return buildPathGeometry(factory, viewport, std::vector<const Geometry*>{&geometry}, filled);
 }
 
 struct Brushes {
@@ -105,12 +113,11 @@ Brushes createBrushes(ID2D1RenderTarget& target) {
     return brushes;
 }
 
-void drawFeature(ID2D1Factory& factory, ID2D1RenderTarget& target, const Viewport& viewport,
-                  const Brushes& brushes, const Feature& feature) {
+void drawGeometry(ID2D1Factory& factory, ID2D1RenderTarget& target, const Viewport& viewport,
+                   const Brushes& brushes, GeometryType type, const Geometry& geometry) {
     static constexpr float kPointRadius = 3.0f;
 
-    const Geometry& geometry = feature.geometry();
-    switch (geometry.type()) {
+    switch (type) {
         case GeometryType::Point:
         case GeometryType::MultiPoint: {
             for (const Part& part : geometry.parts()) {
@@ -126,13 +133,13 @@ void drawFeature(ID2D1Factory& factory, ID2D1RenderTarget& target, const Viewpor
         }
         case GeometryType::LineString:
         case GeometryType::MultiLineString: {
-            const auto path = buildPathGeometry(&factory, viewport, geometry, /*filled=*/false);
+            const auto path = buildPathGeometry(factory, viewport, geometry, /*filled=*/false);
             target.DrawGeometry(path.Get(), brushes.lineStroke.Get(), 1.5f);
             break;
         }
         case GeometryType::Polygon:
         case GeometryType::MultiPolygon: {
-            const auto path = buildPathGeometry(&factory, viewport, geometry, /*filled=*/true);
+            const auto path = buildPathGeometry(factory, viewport, geometry, /*filled=*/true);
             target.FillGeometry(path.Get(), brushes.polygonFill.Get());
             target.DrawGeometry(path.Get(), brushes.polygonStroke.Get(), 1.0f);
             break;
@@ -149,39 +156,104 @@ void drawDataset(ID2D1RenderTarget& target, ID2D1Factory& factory, const Dataset
     const Brushes brushes = createBrushes(target);
     for (const Layer& layer : dataset.layers()) {
         for (const Feature& feature : layer.features()) {
-            drawFeature(factory, target, viewport, brushes, feature);
+            drawGeometry(factory, target, viewport, brushes, feature.geometry().type(), feature.geometry());
         }
     }
 }
 
-ComPtr<IWICBitmap> Renderer::render(const Dataset& dataset, const Viewport& viewport) {
+std::size_t drawDatasetCulled(ID2D1RenderTarget& target, ID2D1Factory& factory, const Dataset& dataset,
+                               const std::vector<LayerCache>& layerCaches, const Viewport& viewport) {
+    const Brushes brushes = createBrushes(target);
+    const double mapUnitsPerPixel = viewport.scale() > 0.0 ? 1.0 / viewport.scale() : 0.0;
+    const Envelope& viewExtent = viewport.mapExtent();
+    static constexpr float kPointRadius = 3.0f;
+
+    const std::vector<Layer>& layers = dataset.layers();
+    std::size_t drawnCount = 0;
+
+    for (std::size_t layerIdx = 0; layerIdx < layers.size() && layerIdx < layerCaches.size(); ++layerIdx) {
+        const LayerCache& cache = layerCaches[layerIdx];
+        const std::vector<std::size_t> visible = cache.query(viewExtent);
+        drawnCount += visible.size();
+
+        std::vector<const Geometry*> lineGeoms;
+        std::vector<const Geometry*> polygonGeoms;
+
+        for (std::size_t featureIdx : visible) {
+            const Geometry& geometry = cache.simplifiedGeometry(featureIdx, mapUnitsPerPixel);
+            switch (geometry.type()) {
+                case GeometryType::Point:
+                case GeometryType::MultiPoint:
+                    for (const Part& part : geometry.parts()) {
+                        for (const Ring& ring : part) {
+                            for (const Point2D& p : ring) {
+                                const D2D1_POINT_2F center = toD2DPoint(viewport.mapToScreen(p));
+                                target.FillEllipse(D2D1::Ellipse(center, kPointRadius, kPointRadius),
+                                                    brushes.pointFill.Get());
+                            }
+                        }
+                    }
+                    break;
+                case GeometryType::LineString:
+                case GeometryType::MultiLineString:
+                    lineGeoms.push_back(&geometry);
+                    break;
+                case GeometryType::Polygon:
+                case GeometryType::MultiPolygon:
+                    polygonGeoms.push_back(&geometry);
+                    break;
+                case GeometryType::Unknown:
+                    break;
+            }
+        }
+
+        if (!lineGeoms.empty()) {
+            const auto path = buildPathGeometry(factory, viewport, lineGeoms, /*filled=*/false);
+            target.DrawGeometry(path.Get(), brushes.lineStroke.Get(), 1.5f);
+        }
+        if (!polygonGeoms.empty()) {
+            const auto path = buildPathGeometry(factory, viewport, polygonGeoms, /*filled=*/true);
+            target.FillGeometry(path.Get(), brushes.polygonFill.Get());
+            target.DrawGeometry(path.Get(), brushes.polygonStroke.Get(), 1.0f);
+        }
+    }
+
+    return drawnCount;
+}
+
+OffscreenTarget::OffscreenTarget(ScreenSize size) {
     const ComPtr<IWICImagingFactory> wicFactory = createWicFactory();
 
-    ComPtr<ID2D1Factory> d2dFactory;
-    throwIfFailed(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2dFactory.GetAddressOf()),
+    throwIfFailed(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2dFactory_.GetAddressOf()),
                   "D2D1CreateFactory");
 
-    ComPtr<IWICBitmap> wicBitmap;
-    throwIfFailed(wicFactory->CreateBitmap(static_cast<UINT>(viewport.screenSize().width),
-                                            static_cast<UINT>(viewport.screenSize().height),
+    throwIfFailed(wicFactory->CreateBitmap(static_cast<UINT>(size.width), static_cast<UINT>(size.height),
                                             GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnDemand,
-                                            &wicBitmap),
+                                            &wicBitmap_),
                   "IWICImagingFactory::CreateBitmap");
 
     const D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
         D2D1_RENDER_TARGET_TYPE_SOFTWARE,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-
-    ComPtr<ID2D1RenderTarget> renderTarget;
-    throwIfFailed(d2dFactory->CreateWicBitmapRenderTarget(wicBitmap.Get(), props, &renderTarget),
+    throwIfFailed(d2dFactory_->CreateWicBitmapRenderTarget(wicBitmap_.Get(), props, &renderTarget_),
                   "CreateWicBitmapRenderTarget");
+}
 
-    renderTarget->BeginDraw();
-    renderTarget->Clear(D2D1::ColorF(D2D1::ColorF::White));
-    drawDataset(*renderTarget.Get(), *d2dFactory.Get(), dataset, viewport);
-    throwIfFailed(renderTarget->EndDraw(), "ID2D1RenderTarget::EndDraw");
+void OffscreenTarget::beginFrame() {
+    renderTarget_->BeginDraw();
+    renderTarget_->Clear(D2D1::ColorF(D2D1::ColorF::White));
+}
 
-    return wicBitmap;
+void OffscreenTarget::endFrame() {
+    throwIfFailed(renderTarget_->EndDraw(), "ID2D1RenderTarget::EndDraw");
+}
+
+ComPtr<IWICBitmap> Renderer::render(const Dataset& dataset, const Viewport& viewport) {
+    OffscreenTarget target(viewport.screenSize());
+    target.beginFrame();
+    drawDataset(target.renderTarget(), target.factory(), dataset, viewport);
+    target.endFrame();
+    return target.bitmap();
 }
 
 void savePng(IWICBitmap* bitmap, const std::string& path) {

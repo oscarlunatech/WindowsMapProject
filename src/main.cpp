@@ -1,6 +1,10 @@
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <format>
+#include <fstream>
 #include <iostream>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -104,6 +108,84 @@ int runRender(const std::string& path, const std::optional<Envelope>& bboxOverri
     return 0;
 }
 
+// Interpolates from the dataset's full extent down to a zoomed-in view of
+// Newark/Jersey City (the densest part of the NJ roads benchmark dataset),
+// giving a fixed, reproducible camera path: frame 0 is the worst case for an
+// unindexed draw (everything visible), the last frame is where culling and
+// simplification should matter least (small, already-dense view).
+std::vector<Envelope> buildCameraPath(const Envelope& fullExtent, int frameCount) {
+    Envelope zoomed;
+    zoomed.expand(Point2D{-74.19 - 0.05, 40.74 - 0.05});
+    zoomed.expand(Point2D{-74.19 + 0.05, 40.74 + 0.05});
+
+    std::vector<Envelope> path;
+    path.reserve(static_cast<std::size_t>(frameCount));
+    for (int i = 0; i < frameCount; ++i) {
+        const double t = frameCount > 1 ? static_cast<double>(i) / static_cast<double>(frameCount - 1) : 0.0;
+        Envelope frame;
+        frame.expand(Point2D{fullExtent.minX + (zoomed.minX - fullExtent.minX) * t,
+                              fullExtent.minY + (zoomed.minY - fullExtent.minY) * t});
+        frame.expand(Point2D{fullExtent.maxX + (zoomed.maxX - fullExtent.maxX) * t,
+                              fullExtent.maxY + (zoomed.maxY - fullExtent.maxY) * t});
+        path.push_back(frame);
+    }
+    return path;
+}
+
+int runBench(const std::string& path, int frameCount, bool culled, const std::string& csvPath) {
+    const Dataset dataset = Dataset::open(path);
+    const std::vector<Envelope> cameraPath = buildCameraPath(dataset.extent(), frameCount);
+
+    // Building the LayerCache (R-tree + precomputed simplification buckets)
+    // happens once, outside the timed loop, same as a live Viewer would do
+    // it at startup - the benchmark measures per-frame draw cost, not index
+    // construction.
+    std::vector<render::LayerCache> layerCaches;
+    if (culled) {
+        layerCaches.reserve(dataset.layers().size());
+        for (const Layer& layer : dataset.layers()) {
+            layerCaches.emplace_back(layer);
+        }
+    }
+
+    const render::ScreenSize size{1024, 768};
+    render::OffscreenTarget target(size);
+
+    std::ofstream csv(csvPath);
+    if (!csv) {
+        throw std::runtime_error("failed to open '" + csvPath + "' for writing");
+    }
+    csv << "frame,ms\n";
+
+    std::vector<double> timings;
+    timings.reserve(static_cast<std::size_t>(frameCount));
+
+    for (int i = 0; i < frameCount; ++i) {
+        const render::Viewport viewport(cameraPath[static_cast<std::size_t>(i)], size);
+
+        const auto start = std::chrono::high_resolution_clock::now();
+        target.beginFrame();
+        if (culled) {
+            render::drawDatasetCulled(target.renderTarget(), target.factory(), dataset, layerCaches, viewport);
+        } else {
+            render::drawDataset(target.renderTarget(), target.factory(), dataset, viewport);
+        }
+        target.endFrame();
+        const auto end = std::chrono::high_resolution_clock::now();
+
+        const double ms = std::chrono::duration<double, std::milli>(end - start).count();
+        timings.push_back(ms);
+        csv << i << "," << ms << "\n";
+    }
+
+    const double avg = std::accumulate(timings.begin(), timings.end(), 0.0) /
+                        static_cast<double>(timings.size());
+    const auto [minIt, maxIt] = std::minmax_element(timings.begin(), timings.end());
+    std::cout << std::format("frames: {}  culled: {}  avg: {:.2f}ms  min: {:.2f}ms  max: {:.2f}ms  -> {}\n",
+                              frameCount, culled, avg, *minIt, *maxIt, csvPath);
+    return 0;
+}
+
 int runView(const std::string& path) {
     Dataset dataset = Dataset::open(path);
     const Envelope extent = dataset.extent();
@@ -117,8 +199,9 @@ void printUsage(const char* argv0) {
         "usage: {} info <path>\n"
         "       {} dump <path> [--limit N]\n"
         "       {} render <path> [--bbox minX,minY,maxX,maxY] [--size WxH] -o <output.png>\n"
-        "       {} view <path>\n",
-        argv0, argv0, argv0, argv0);
+        "       {} view <path>\n"
+        "       {} bench <path> [--frames N] [--culled] [-o results.csv]\n",
+        argv0, argv0, argv0, argv0, argv0);
 }
 
 }  // namespace
@@ -168,6 +251,22 @@ int main(int argc, char** argv) {
         }
         if (command == "view") {
             return runView(path);
+        }
+        if (command == "bench") {
+            int frames = 60;
+            bool culled = false;
+            std::string output = "bench_results.csv";
+            for (int i = 3; i < argc; ++i) {
+                const std::string_view arg = argv[i];
+                if (arg == "--frames" && i + 1 < argc) {
+                    frames = std::atoi(argv[++i]);
+                } else if (arg == "--culled") {
+                    culled = true;
+                } else if (arg == "-o" && i + 1 < argc) {
+                    output = argv[++i];
+                }
+            }
+            return runBench(path, frames, culled, output);
         }
     } catch (const std::exception& e) {
         std::cerr << std::format("error: {}\n", e.what());
