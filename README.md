@@ -2,7 +2,7 @@
 
 A narrow, fast, correct desktop GIS viewer for Windows. C++ core, WPF shell.
 
-Status: **Phase 0 — build environment.** Nothing runnable yet.
+Status: **Phase 3 (live window) complete.** Phase 4 (make it fast) is next. See [DECISIONS.md](DECISIONS.md) and [BENCHMARKS.md](BENCHMARKS.md) for the running log.
 
 ## Design goals
 
@@ -32,7 +32,19 @@ Configure and build from a **Developer PowerShell for VS** (Ninja needs `cl.exe`
 ```
 cmake --preset x64-debug
 cmake --build --preset x64-debug
+ctest --preset x64-debug
 ```
+
+## Usage
+
+```
+cartograph_cli info <path>
+cartograph_cli dump <path> [--limit N]
+cartograph_cli render <path> [--bbox minX,minY,maxX,maxY] [--size WxH] -o <output.png>
+cartograph_cli view <path>
+```
+
+`info`/`dump` print layer metadata and feature attributes. `render` draws a dataset to a PNG with no window (used for the golden-image tests). `view` opens a live window: left-drag to pan, scroll wheel to zoom under the cursor, arrow keys to pan, `+`/`-` to zoom.
 
 ## Explicitly out of scope
 
