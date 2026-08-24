@@ -4,7 +4,9 @@
 #include <d2d1helper.h>
 #include <windows.h>
 
+#include <algorithm>
 #include <cstddef>
+#include <future>
 
 using Microsoft::WRL::ComPtr;
 
@@ -92,6 +94,120 @@ ComPtr<ID2D1PathGeometry> buildPathGeometry(ID2D1Factory& factory, const Viewpor
     return buildPathGeometry(factory, viewport, std::vector<const Geometry*>{&geometry}, filled);
 }
 
+// A ring already transformed to screen space - plain data, safe to compute
+// on a worker thread since it touches no D2D objects.
+using ScreenRing = std::vector<D2D1_POINT_2F>;
+
+std::vector<ScreenRing> transformGeometryRings(const Viewport& viewport,
+                                                const std::vector<const Geometry*>& geometries) {
+    std::vector<ScreenRing> screenRings;
+    for (const Geometry* geometry : geometries) {
+        for (const Part& part : geometry->parts()) {
+            for (const Ring& ring : part) {
+                if (ring.empty()) {
+                    continue;
+                }
+                ScreenRing screenRing;
+                screenRing.reserve(ring.size());
+                for (const Point2D& p : ring) {
+                    screenRing.push_back(toD2DPoint(viewport.mapToScreen(p)));
+                }
+                screenRings.push_back(std::move(screenRing));
+            }
+        }
+    }
+    return screenRings;
+}
+
+// Same sink-writing shape as buildPathGeometry above, but consuming
+// already-transformed screen-space rings instead of Geometry+Viewport - the
+// D2D-touching half of what buildPathGeometry used to do in one pass.
+ComPtr<ID2D1PathGeometry> buildPathGeometryFromRings(ID2D1Factory& factory, const std::vector<ScreenRing>& rings,
+                                                      bool filled) {
+    ComPtr<ID2D1PathGeometry> path;
+    throwIfFailed(factory.CreatePathGeometry(&path), "CreatePathGeometry");
+
+    ComPtr<ID2D1GeometrySink> sink;
+    throwIfFailed(path->Open(&sink), "ID2D1PathGeometry::Open");
+    sink->SetFillMode(D2D1_FILL_MODE_ALTERNATE);
+
+    const D2D1_FIGURE_BEGIN beginMode = filled ? D2D1_FIGURE_BEGIN_FILLED : D2D1_FIGURE_BEGIN_HOLLOW;
+    const D2D1_FIGURE_END endMode = filled ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN;
+
+    for (const ScreenRing& ring : rings) {
+        sink->BeginFigure(ring.front(), beginMode);
+        for (std::size_t i = 1; i < ring.size(); ++i) {
+            sink->AddLine(ring[i]);
+        }
+        sink->EndFigure(endMode);
+    }
+
+    throwIfFailed(sink->Close(), "ID2D1GeometrySink::Close");
+    return path;
+}
+
+// Everything drawDatasetCulled needs from one layer. lineGeometry/
+// polygonGeometry are fully-built ID2D1PathGeometry resources - safe to
+// build on a pool worker (not just the coordinate math) because the factory
+// is created D2D1_FACTORY_TYPE_MULTI_THREADED, which allows concurrent
+// resource creation as long as no two threads touch the *same* resource at
+// once (each worker builds its own layers' geometries, never shared). Only
+// ID2D1RenderTarget itself stays thread-affine regardless of factory type,
+// which is why the actual DrawGeometry/FillGeometry/FillEllipse calls in
+// drawDatasetCulled below stay on the caller's thread.
+struct PreparedLayer {
+    ComPtr<ID2D1PathGeometry> lineGeometry;     // null if the layer has no visible lines
+    ComPtr<ID2D1PathGeometry> polygonGeometry;  // null if the layer has no visible polygons
+    std::vector<D2D1_POINT_2F> points;
+    std::size_t visibleCount = 0;
+};
+
+PreparedLayer prepareLayer(ID2D1Factory& factory, const LayerCache& cache, const Viewport& viewport,
+                            double mapUnitsPerPixel, const Envelope& viewExtent) {
+    PreparedLayer prepared;
+    const std::vector<std::size_t> visible = cache.query(viewExtent);
+    prepared.visibleCount = visible.size();
+
+    std::vector<const Geometry*> lineGeoms;
+    std::vector<const Geometry*> polygonGeoms;
+
+    for (std::size_t featureIdx : visible) {
+        const Geometry& geometry = cache.simplifiedGeometry(featureIdx, mapUnitsPerPixel);
+        switch (geometry.type()) {
+            case GeometryType::Point:
+            case GeometryType::MultiPoint:
+                for (const Part& part : geometry.parts()) {
+                    for (const Ring& ring : part) {
+                        for (const Point2D& p : ring) {
+                            prepared.points.push_back(toD2DPoint(viewport.mapToScreen(p)));
+                        }
+                    }
+                }
+                break;
+            case GeometryType::LineString:
+            case GeometryType::MultiLineString:
+                lineGeoms.push_back(&geometry);
+                break;
+            case GeometryType::Polygon:
+            case GeometryType::MultiPolygon:
+                polygonGeoms.push_back(&geometry);
+                break;
+            case GeometryType::Unknown:
+                break;
+        }
+    }
+
+    if (!lineGeoms.empty()) {
+        const std::vector<ScreenRing> lineRings = transformGeometryRings(viewport, lineGeoms);
+        prepared.lineGeometry = buildPathGeometryFromRings(factory, lineRings, /*filled=*/false);
+    }
+    if (!polygonGeoms.empty()) {
+        const std::vector<ScreenRing> polygonRings = transformGeometryRings(viewport, polygonGeoms);
+        prepared.polygonGeometry = buildPathGeometryFromRings(factory, polygonRings, /*filled=*/true);
+    }
+    return prepared;
+}
+
 struct Brushes {
     ComPtr<ID2D1SolidColorBrush> polygonFill;
     ComPtr<ID2D1SolidColorBrush> polygonStroke;
@@ -162,59 +278,66 @@ void drawDataset(ID2D1RenderTarget& target, ID2D1Factory& factory, const Dataset
 }
 
 std::size_t drawDatasetCulled(ID2D1RenderTarget& target, ID2D1Factory& factory, const Dataset& dataset,
-                               const std::vector<LayerCache>& layerCaches, const Viewport& viewport) {
+                               const std::vector<LayerCache>& layerCaches, const Viewport& viewport,
+                               jobs::ThreadPool& pool) {
     const Brushes brushes = createBrushes(target);
     const double mapUnitsPerPixel = viewport.scale() > 0.0 ? 1.0 / viewport.scale() : 0.0;
-    const Envelope& viewExtent = viewport.mapExtent();
+    const Envelope viewExtent = viewport.mapExtent();
     static constexpr float kPointRadius = 3.0f;
 
-    const std::vector<Layer>& layers = dataset.layers();
-    std::size_t drawnCount = 0;
+    // Parenthesized (std::min) - see the comment on ThreadPool's constructor
+    // in thread_pool.h for why, in a TU that also includes windows.h.
+    const std::size_t layerCount = (std::min)(dataset.layers().size(), layerCaches.size());
 
-    for (std::size_t layerIdx = 0; layerIdx < layers.size() && layerIdx < layerCaches.size(); ++layerIdx) {
-        const LayerCache& cache = layerCaches[layerIdx];
-        const std::vector<std::size_t> visible = cache.query(viewExtent);
-        drawnCount += visible.size();
-
-        std::vector<const Geometry*> lineGeoms;
-        std::vector<const Geometry*> polygonGeoms;
-
-        for (std::size_t featureIdx : visible) {
-            const Geometry& geometry = cache.simplifiedGeometry(featureIdx, mapUnitsPerPixel);
-            switch (geometry.type()) {
-                case GeometryType::Point:
-                case GeometryType::MultiPoint:
-                    for (const Part& part : geometry.parts()) {
-                        for (const Ring& ring : part) {
-                            for (const Point2D& p : ring) {
-                                const D2D1_POINT_2F center = toD2DPoint(viewport.mapToScreen(p));
-                                target.FillEllipse(D2D1::Ellipse(center, kPointRadius, kPointRadius),
-                                                    brushes.pointFill.Get());
-                            }
-                        }
-                    }
-                    break;
-                case GeometryType::LineString:
-                case GeometryType::MultiLineString:
-                    lineGeoms.push_back(&geometry);
-                    break;
-                case GeometryType::Polygon:
-                case GeometryType::MultiPolygon:
-                    polygonGeoms.push_back(&geometry);
-                    break;
-                case GeometryType::Unknown:
-                    break;
+    // Phase 1 (parallel): query + simplify + transform + build each layer's
+    // ID2D1PathGeometry resources. Safe on pool workers because factory is
+    // D2D1_FACTORY_TYPE_MULTI_THREADED (see PreparedLayer's comment) - only
+    // ID2D1RenderTarget itself needs to stay off worker threads. Chunked
+    // into at most pool.size() tasks (each covering a contiguous range of
+    // layers) rather than one task per layer: with ~20 layers, one-task-
+    // per-layer means per-task overhead (a heap-allocated packaged_task, a
+    // mutex lock, a condition-variable wake) dominates the actual work every
+    // frame, which measured as a net slowdown. Each chunk writes only its
+    // own disjoint slice of prepared, so this is race-free without needing
+    // a lock. Submitted from this (non-worker) thread and collected below
+    // before returning, so this never nests pool work inside pool work.
+    std::vector<PreparedLayer> prepared(layerCount);
+    const std::size_t chunkCount = layerCount == 0 ? 0 : (std::min)(layerCount, pool.size());
+    std::vector<std::future<void>> futures;
+    futures.reserve(chunkCount);
+    for (std::size_t chunk = 0; chunk < chunkCount; ++chunk) {
+        const std::size_t begin = layerCount * chunk / chunkCount;
+        const std::size_t end = layerCount * (chunk + 1) / chunkCount;
+        futures.push_back(pool.submit([&factory, &layerCaches, &viewport, mapUnitsPerPixel, viewExtent, &prepared,
+                                        begin, end] {
+            for (std::size_t layerIdx = begin; layerIdx < end; ++layerIdx) {
+                prepared[layerIdx] =
+                    prepareLayer(factory, layerCaches[layerIdx], viewport, mapUnitsPerPixel, viewExtent);
             }
-        }
+        }));
+    }
+    for (std::future<void>& future : futures) {
+        future.get();
+    }
 
-        if (!lineGeoms.empty()) {
-            const auto path = buildPathGeometry(factory, viewport, lineGeoms, /*filled=*/false);
-            target.DrawGeometry(path.Get(), brushes.lineStroke.Get(), 1.5f);
+    // Phase 2 (serial): submit each layer's already-built geometry to the
+    // render target on this thread - ID2D1RenderTarget itself is thread-
+    // affine regardless of factory type, so this is the only place allowed
+    // to touch it. Cheap relative to phase 1 now that the sink-writing
+    // (BeginFigure/AddLine per point) happened in parallel above.
+    std::size_t drawnCount = 0;
+    for (const PreparedLayer& layer : prepared) {
+        drawnCount += layer.visibleCount;
+
+        for (const D2D1_POINT_2F& center : layer.points) {
+            target.FillEllipse(D2D1::Ellipse(center, kPointRadius, kPointRadius), brushes.pointFill.Get());
         }
-        if (!polygonGeoms.empty()) {
-            const auto path = buildPathGeometry(factory, viewport, polygonGeoms, /*filled=*/true);
-            target.FillGeometry(path.Get(), brushes.polygonFill.Get());
-            target.DrawGeometry(path.Get(), brushes.polygonStroke.Get(), 1.0f);
+        if (layer.lineGeometry) {
+            target.DrawGeometry(layer.lineGeometry.Get(), brushes.lineStroke.Get(), 1.5f);
+        }
+        if (layer.polygonGeometry) {
+            target.FillGeometry(layer.polygonGeometry.Get(), brushes.polygonFill.Get());
+            target.DrawGeometry(layer.polygonGeometry.Get(), brushes.polygonStroke.Get(), 1.0f);
         }
     }
 
@@ -224,7 +347,10 @@ std::size_t drawDatasetCulled(ID2D1RenderTarget& target, ID2D1Factory& factory, 
 OffscreenTarget::OffscreenTarget(ScreenSize size) {
     const ComPtr<IWICImagingFactory> wicFactory = createWicFactory();
 
-    throwIfFailed(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2dFactory_.GetAddressOf()),
+    // MULTI_THREADED: shared by Renderer::render (drawDataset, single-
+    // threaded regardless - unaffected) and bench --culled (drawDatasetCulled,
+    // which needs it - see renderer.h).
+    throwIfFailed(D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, d2dFactory_.GetAddressOf()),
                   "D2D1CreateFactory");
 
     throwIfFailed(wicFactory->CreateBitmap(static_cast<UINT>(size.width), static_cast<UINT>(size.height),

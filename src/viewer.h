@@ -6,9 +6,13 @@
 #include <dwrite.h>
 #include <wrl/client.h>
 
+#include <optional>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include "cartograph/dataset.h"
+#include "cartograph/jobs/thread_pool.h"
 #include "cartograph/render/layer_cache.h"
 #include "cartograph/render/viewport.h"
 
@@ -18,13 +22,25 @@
 // it only supplies drawDatasetCulled() (see cartograph/render/renderer.h),
 // which this class calls into every frame using a LayerCache built once per
 // layer at startup.
+//
+// The dataset itself is opened and its LayerCaches built on a background
+// thread (loaderThread_) so the window appears immediately instead of
+// blocking on Dataset::open() - see loadInBackground() in viewer.cpp. pool_
+// serves both that one-off load and the per-frame parallel layer-prep work
+// inside drawDatasetCulled.
 class Viewer {
 public:
-    Viewer(cartograph::Dataset dataset, cartograph::Envelope initialExtent);
+    explicit Viewer(std::string path);
+    ~Viewer();
+
+    Viewer(const Viewer&) = delete;
+    Viewer& operator=(const Viewer&) = delete;
 
     void run();
 
 private:
+    enum class LoadState { Loading, Ready, Failed };
+
     static LRESULT CALLBACK wndProcTrampoline(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     LRESULT handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -35,12 +51,19 @@ private:
     void onMouseWheel(short wheelDelta, POINT clientPos);
     void onKeyDown(WPARAM key);
     void zoomAt(cartograph::Point2D anchorMap, double factor);
+    void loadInBackground(HWND hwnd);  // runs on loaderThread_
 
     cartograph::render::Viewport currentViewport() const;
 
-    cartograph::Dataset dataset_;
+    std::string datasetPath_;
+    cartograph::jobs::ThreadPool pool_;
+    std::thread loaderThread_;
+    LoadState loadState_ = LoadState::Loading;
+    std::wstring loadMessage_;  // overlay text while loadState_ != Ready; set in the constructor and on failure
+
+    std::optional<cartograph::Dataset> dataset_;  // engaged once loadState_ == Ready
     std::size_t totalFeatureCount_ = 0;
-    std::vector<cartograph::render::LayerCache> layerCaches_;  // one per dataset_.layers(), built once
+    std::vector<cartograph::render::LayerCache> layerCaches_;  // one per dataset_->layers(), built once
     cartograph::Envelope mapExtent_;
     cartograph::render::ScreenSize screenSize_{1024, 768};
 

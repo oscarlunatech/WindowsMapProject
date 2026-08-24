@@ -8,6 +8,7 @@ add_library(Cartograph.Core STATIC
     src/render/viewport.cpp
     src/render/renderer.cpp
     src/render/layer_cache.cpp
+    src/jobs/thread_pool.cpp
 )
 add_library(Cartograph::Core ALIAS Cartograph.Core)
 

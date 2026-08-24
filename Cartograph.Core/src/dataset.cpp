@@ -4,24 +4,27 @@
 #include <gdal_priv.h>
 #include <ogrsf_frmts.h>
 
+#include <mutex>
+
 namespace cartograph {
 
 namespace {
 
 // proj.db ships next to the running executable (see CMakeLists.txt); PROJ
-// doesn't discover it there on its own.
+// doesn't discover it there on its own. std::call_once (rather than a plain
+// static bool) matters now that Dataset::open can be called from a
+// background loader thread (Phase 5) - a plain bool double-checked-init has
+// no memory barrier and would race if two threads ever called open() at
+// nearly the same time.
 void ensurePlatformSetup() {
-    static bool initialized = false;
-    if (initialized) {
-        return;
-    }
-    initialized = true;
-
-    char exePath[1024];
-    if (CPLGetExecPath(exePath, sizeof(exePath))) {
-        CPLSetConfigOption("PROJ_DATA", CPLGetDirname(exePath));
-    }
-    GDALAllRegister();
+    static std::once_flag initialized;
+    std::call_once(initialized, [] {
+        char exePath[1024];
+        if (CPLGetExecPath(exePath, sizeof(exePath))) {
+            CPLSetConfigOption("PROJ_DATA", CPLGetDirname(exePath));
+        }
+        GDALAllRegister();
+    });
 }
 
 FieldType convertFieldType(OGRFieldType type) {

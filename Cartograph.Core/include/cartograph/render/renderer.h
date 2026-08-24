@@ -10,6 +10,7 @@
 #include <wrl/client.h>
 
 #include "cartograph/dataset.h"
+#include "cartograph/jobs/thread_pool.h"
 #include "cartograph/render/layer_cache.h"
 #include "cartograph/render/viewport.h"
 
@@ -36,8 +37,19 @@ void drawDataset(ID2D1RenderTarget& target, ID2D1Factory& factory, const Dataset
 // as dataset.layers(), one entry per layer in order. Returns the total
 // number of features actually drawn (for a "features drawn"/"culled"
 // overlay - see Viewer::onPaint).
+//
+// Each layer's spatial-index query, simplification-bucket lookup,
+// map-to-screen coordinate transform, AND ID2D1PathGeometry construction
+// (the sink-writing itself) run in parallel across pool; only the final
+// DrawGeometry/FillGeometry/FillEllipse submission onto target happens
+// serially on the calling thread, since ID2D1RenderTarget stays
+// thread-affine no matter the factory's threading mode. This requires
+// factory to have been created D2D1_FACTORY_TYPE_MULTI_THREADED (not
+// SINGLE_THREADED) - that's what makes concurrent resource creation across
+// pool workers safe.
 std::size_t drawDatasetCulled(ID2D1RenderTarget& target, ID2D1Factory& factory, const Dataset& dataset,
-                               const std::vector<LayerCache>& layerCaches, const Viewport& viewport);
+                               const std::vector<LayerCache>& layerCaches, const Viewport& viewport,
+                               jobs::ThreadPool& pool);
 
 // A reusable off-screen D2D render target backed by a WIC bitmap, forcing
 // the software (WARP) rasterizer for reproducibility. Exists so repeated

@@ -1,6 +1,7 @@
 #include "cartograph/render/layer_cache.h"
 
 #include <cmath>
+#include <future>
 
 #include "cartograph/geom/simplify.h"
 
@@ -54,6 +55,21 @@ const Geometry& LayerCache::simplifiedGeometry(std::size_t featureIndex, double 
     }
 
     return simplifiedByBucket_[bucket][featureIndex];
+}
+
+std::vector<LayerCache> buildLayerCachesParallel(jobs::ThreadPool& pool, const std::vector<Layer>& layers) {
+    std::vector<std::future<LayerCache>> futures;
+    futures.reserve(layers.size());
+    for (const Layer& layer : layers) {
+        futures.push_back(pool.submit([&layer] { return LayerCache(layer); }));
+    }
+
+    std::vector<LayerCache> caches;
+    caches.reserve(futures.size());
+    for (std::future<LayerCache>& future : futures) {
+        caches.push_back(future.get());
+    }
+    return caches;
 }
 
 }  // namespace cartograph::render

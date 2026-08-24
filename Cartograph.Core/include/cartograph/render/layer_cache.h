@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "cartograph/index/spatial_index.h"
+#include "cartograph/jobs/thread_pool.h"
 #include "cartograph/layer.h"
 
 namespace cartograph::render {
@@ -29,5 +30,13 @@ private:
     std::vector<double> tolerances_;                    // ascending, tolerances_[0] == 0
     std::vector<std::vector<Geometry>> simplifiedByBucket_;  // [bucket][featureIndex]
 };
+
+// Builds one LayerCache per layer, one construction (R-tree bulk-load + all
+// simplification buckets) submitted to pool per layer, since each layer's
+// LayerCache only reads its own Layer - safe to build concurrently. Called
+// from a thread that isn't itself a pool worker (e.g. Viewer's background
+// loader thread, or a CLI command's main thread), never from inside a task
+// already running on pool.
+std::vector<LayerCache> buildLayerCachesParallel(jobs::ThreadPool& pool, const std::vector<Layer>& layers);
 
 }  // namespace cartograph::render

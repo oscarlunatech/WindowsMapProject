@@ -6,13 +6,17 @@
 
 #include <cstdio>
 #include <cwchar>
+#include <memory>
 #include <string>
+#include <utility>
 
 #include "cartograph/render/renderer.h"
 
 using cartograph::Dataset;
 using cartograph::Envelope;
+using cartograph::Layer;
 using cartograph::Point2D;
+using cartograph::render::LayerCache;
 using cartograph::render::RenderError;
 using cartograph::render::ScreenSize;
 using cartograph::render::Viewport;
@@ -25,18 +29,43 @@ void throwIfFailed(HRESULT hr, const char* what) {
     }
 }
 
+std::wstring widen(const std::string& s) {
+    if (s.empty()) {
+        return {};
+    }
+    const int size = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    std::wstring result(static_cast<std::size_t>(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), result.data(), size);
+    return result;
+}
+
 constexpr double kZoomFactorPerNotch = 1.1;
 constexpr double kPanFraction = 0.1;
 constexpr wchar_t kWindowClassName[] = L"CartographViewerWindowClass";
+constexpr UINT kMsgDatasetLoaded = WM_APP + 1;
+
+// Posted from loaderThread_ to the UI thread via PostMessageW/kMsgDatasetLoaded
+// (see Viewer::loadInBackground) - the only cross-thread handoff in Viewer,
+// and the only reason no mutex is needed: dataset_/layerCaches_/mapExtent_
+// are written exclusively by the UI thread, in handleMessage below, once it
+// takes ownership of this struct out of the message's LPARAM.
+struct LoadResult {
+    std::optional<Dataset> dataset;
+    std::vector<LayerCache> layerCaches;
+    Envelope extent;
+    std::size_t featureCount = 0;
+    std::wstring errorMessage;  // engaged only when dataset is nullopt
+};
 
 }  // namespace
 
-Viewer::Viewer(Dataset dataset, Envelope initialExtent)
-    : dataset_(std::move(dataset)), mapExtent_(initialExtent) {
-    layerCaches_.reserve(dataset_.layers().size());
-    for (const auto& layer : dataset_.layers()) {
-        totalFeatureCount_ += layer.features().size();
-        layerCaches_.emplace_back(layer);
+Viewer::Viewer(std::string path) : datasetPath_(std::move(path)) {
+    loadMessage_ = L"Loading " + widen(datasetPath_) + L"...";
+}
+
+Viewer::~Viewer() {
+    if (loaderThread_.joinable()) {
+        loaderThread_.join();
     }
 }
 
@@ -62,11 +91,38 @@ void Viewer::run() {
     ShowWindow(hwnd, SW_SHOWNORMAL);
     UpdateWindow(hwnd);
 
+    loaderThread_ = std::thread(&Viewer::loadInBackground, this, hwnd);
+
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+}
+
+void Viewer::loadInBackground(HWND hwnd) {
+    auto result = std::make_unique<LoadResult>();
+    try {
+        Dataset dataset = Dataset::open(datasetPath_);
+        const Envelope extent = dataset.extent();
+        std::size_t featureCount = 0;
+        for (const Layer& layer : dataset.layers()) {
+            featureCount += layer.features().size();
+        }
+
+        // buildLayerCachesParallel captures const Layer& references into
+        // dataset's own layers while it builds each LayerCache concurrently
+        // on pool_ - dataset must not move until that call returns.
+        std::vector<LayerCache> caches = cartograph::render::buildLayerCachesParallel(pool_, dataset.layers());
+
+        result->dataset = std::move(dataset);
+        result->layerCaches = std::move(caches);
+        result->extent = extent;
+        result->featureCount = featureCount;
+    } catch (const std::exception& e) {
+        result->errorMessage = widen(e.what());
+    }
+    PostMessageW(hwnd, kMsgDatasetLoaded, 0, reinterpret_cast<LPARAM>(result.release()));
 }
 
 LRESULT CALLBACK Viewer::wndProcTrampoline(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -118,6 +174,21 @@ LRESULT Viewer::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case WM_KEYDOWN:
             onKeyDown(wParam);
             return 0;
+        case kMsgDatasetLoaded: {
+            std::unique_ptr<LoadResult> result(reinterpret_cast<LoadResult*>(lParam));
+            if (result->dataset) {
+                dataset_ = std::move(result->dataset);
+                layerCaches_ = std::move(result->layerCaches);
+                totalFeatureCount_ = result->featureCount;
+                mapExtent_ = result->extent;
+                loadState_ = LoadState::Ready;
+            } else {
+                loadState_ = LoadState::Failed;
+                loadMessage_ = L"Failed to load " + widen(datasetPath_) + L": " + result->errorMessage;
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         case WM_DESTROY:
             PostQuitMessage(0);
             return 0;
@@ -131,7 +202,11 @@ void Viewer::createDeviceResources(HWND hwnd) {
         return;
     }
 
-    throwIfFailed(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2dFactory_.GetAddressOf()),
+    // MULTI_THREADED (not SINGLE_THREADED): drawDatasetCulled builds each
+    // layer's ID2D1PathGeometry on a pool worker thread - see the comment on
+    // drawDatasetCulled in renderer.h. ID2D1RenderTarget itself still only
+    // gets touched from this (the UI) thread regardless.
+    throwIfFailed(D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, d2dFactory_.GetAddressOf()),
                   "D2D1CreateFactory");
     throwIfFailed(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
                                        reinterpret_cast<IUnknown**>(writeFactory_.GetAddressOf())),
@@ -167,28 +242,36 @@ void Viewer::onPaint(HWND hwnd) {
     PAINTSTRUCT ps;
     BeginPaint(hwnd, &ps);
 
-    LARGE_INTEGER freq;
-    LARGE_INTEGER start;
-    LARGE_INTEGER end;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&start);
-
     renderTarget_->BeginDraw();
     renderTarget_->Clear(D2D1::ColorF(D2D1::ColorF::White));
-    const std::size_t drawnCount = cartograph::render::drawDatasetCulled(
-        *renderTarget_.Get(), *d2dFactory_.Get(), dataset_, layerCaches_, currentViewport());
 
-    QueryPerformanceCounter(&end);
-    const double ms =
-        1000.0 * static_cast<double>(end.QuadPart - start.QuadPart) / static_cast<double>(freq.QuadPart);
+    if (loadState_ != LoadState::Ready) {
+        const D2D1_RECT_F layoutRect = D2D1::RectF(8.0f, 8.0f, static_cast<float>(screenSize_.width) - 8.0f,
+                                                     static_cast<float>(screenSize_.height) - 8.0f);
+        renderTarget_->DrawText(loadMessage_.c_str(), static_cast<UINT32>(loadMessage_.size()), textFormat_.Get(),
+                                 layoutRect, overlayBrush_.Get());
+    } else {
+        LARGE_INTEGER freq;
+        LARGE_INTEGER start;
+        LARGE_INTEGER end;
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&start);
 
-    wchar_t overlay[256];
-    swprintf_s(overlay, L"ms/frame: %.2f   features drawn: %zu   culled: %zu", ms, drawnCount,
-               totalFeatureCount_ - drawnCount);
-    const D2D1_RECT_F layoutRect =
-        D2D1::RectF(8.0f, 8.0f, static_cast<float>(screenSize_.width) - 8.0f, 32.0f);
-    renderTarget_->DrawText(overlay, static_cast<UINT32>(wcslen(overlay)), textFormat_.Get(), layoutRect,
-                             overlayBrush_.Get());
+        const std::size_t drawnCount = cartograph::render::drawDatasetCulled(
+            *renderTarget_.Get(), *d2dFactory_.Get(), *dataset_, layerCaches_, currentViewport(), pool_);
+
+        QueryPerformanceCounter(&end);
+        const double ms =
+            1000.0 * static_cast<double>(end.QuadPart - start.QuadPart) / static_cast<double>(freq.QuadPart);
+
+        wchar_t overlay[256];
+        swprintf_s(overlay, L"ms/frame: %.2f   features drawn: %zu   culled: %zu", ms, drawnCount,
+                   totalFeatureCount_ - drawnCount);
+        const D2D1_RECT_F layoutRect =
+            D2D1::RectF(8.0f, 8.0f, static_cast<float>(screenSize_.width) - 8.0f, 32.0f);
+        renderTarget_->DrawText(overlay, static_cast<UINT32>(wcslen(overlay)), textFormat_.Get(), layoutRect,
+                                 overlayBrush_.Get());
+    }
 
     const HRESULT hr = renderTarget_->EndDraw();
     if (hr == D2DERR_RECREATE_TARGET) {

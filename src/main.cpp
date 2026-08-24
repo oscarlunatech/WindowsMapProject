@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "cartograph/dataset.h"
+#include "cartograph/jobs/thread_pool.h"
 #include "cartograph/render/renderer.h"
 #include "viewer.h"
 
@@ -139,13 +140,12 @@ int runBench(const std::string& path, int frameCount, bool culled, const std::st
     // Building the LayerCache (R-tree + precomputed simplification buckets)
     // happens once, outside the timed loop, same as a live Viewer would do
     // it at startup - the benchmark measures per-frame draw cost, not index
-    // construction.
+    // construction. Built in parallel across layers via the same
+    // jobs::ThreadPool the timed loop below uses per-frame.
+    jobs::ThreadPool pool;
     std::vector<render::LayerCache> layerCaches;
     if (culled) {
-        layerCaches.reserve(dataset.layers().size());
-        for (const Layer& layer : dataset.layers()) {
-            layerCaches.emplace_back(layer);
-        }
+        layerCaches = render::buildLayerCachesParallel(pool, dataset.layers());
     }
 
     const render::ScreenSize size{1024, 768};
@@ -166,7 +166,8 @@ int runBench(const std::string& path, int frameCount, bool culled, const std::st
         const auto start = std::chrono::high_resolution_clock::now();
         target.beginFrame();
         if (culled) {
-            render::drawDatasetCulled(target.renderTarget(), target.factory(), dataset, layerCaches, viewport);
+            render::drawDatasetCulled(target.renderTarget(), target.factory(), dataset, layerCaches, viewport,
+                                       pool);
         } else {
             render::drawDataset(target.renderTarget(), target.factory(), dataset, viewport);
         }
@@ -187,9 +188,7 @@ int runBench(const std::string& path, int frameCount, bool culled, const std::st
 }
 
 int runView(const std::string& path) {
-    Dataset dataset = Dataset::open(path);
-    const Envelope extent = dataset.extent();
-    Viewer viewer(std::move(dataset), extent);
+    Viewer viewer(path);
     viewer.run();
     return 0;
 }
