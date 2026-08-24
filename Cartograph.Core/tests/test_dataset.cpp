@@ -22,7 +22,11 @@ TEST_CASE("Natural Earth countries fixture loads correctly", "[dataset]") {
 
     REQUIRE(layer.features().size() > 150);  // ~177 countries at 110m scale
     REQUIRE(layer.extent().valid);
-    REQUIRE_FALSE(layer.crsWkt().empty());
+    // The fixture's own .prj is already WGS84, so this exercises the
+    // identity-transform path in dataset.cpp's reprojection (Phase 6) - the
+    // label still reports EPSG:4326, confirming a transform was applied
+    // (not just "left as whatever the source file said").
+    REQUIRE(layer.crsWkt() == "EPSG:4326");
     REQUIRE_FALSE(layer.fields().empty());
 
     for (const Feature& feature : layer.features()) {

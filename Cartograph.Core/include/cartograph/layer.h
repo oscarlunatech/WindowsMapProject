@@ -30,6 +30,12 @@ public:
     const std::vector<FieldDef>& fields() const { return fields_; }
     const std::vector<Feature>& features() const { return features_; }
     const Envelope& extent() const { return extent_; }
+
+    // The CRS this layer's geometry is actually in - not necessarily the
+    // source file's original CRS. Dataset::open() reprojects every layer to
+    // one common target CRS at load time (see dataset.cpp), so this reports
+    // that target CRS if a transform was applied, or is empty if the source
+    // file had no CRS metadata to reproject from in the first place.
     const std::string& crsWkt() const { return crsWkt_; }
 
 private:

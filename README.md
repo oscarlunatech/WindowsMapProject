@@ -2,7 +2,7 @@
 
 A narrow, fast, correct desktop GIS viewer for Windows. C++ core, WPF shell.
 
-Status: **Phase 5 (threading) complete.** Phase 6 (reprojection) is next. See [DECISIONS.md](DECISIONS.md) and [BENCHMARKS.md](BENCHMARKS.md) for the running log.
+Status: **Phase 6 (reprojection) complete.** Phase 7 (symbology) is next. See [DECISIONS.md](DECISIONS.md) and [BENCHMARKS.md](BENCHMARKS.md) for the running log.
 
 ## Design goals
 

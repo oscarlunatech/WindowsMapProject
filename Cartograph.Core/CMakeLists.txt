@@ -1,4 +1,5 @@
 find_package(boost_geometry REQUIRED CONFIG)
+find_package(PROJ CONFIG REQUIRED)
 
 add_library(Cartograph.Core STATIC
     src/geometry.cpp
@@ -9,6 +10,7 @@ add_library(Cartograph.Core STATIC
     src/render/renderer.cpp
     src/render/layer_cache.cpp
     src/jobs/thread_pool.cpp
+    src/crs/transformer.cpp
 )
 add_library(Cartograph::Core ALIAS Cartograph.Core)
 
@@ -21,6 +23,9 @@ target_link_libraries(Cartograph.Core PUBLIC GDAL::GDAL d2d1 windowscodecs ole32
 # Boost.Geometry (including index::rtree) is header-only and stays hidden
 # behind SpatialIndex's pimpl, so it's a private implementation detail.
 target_link_libraries(Cartograph.Core PRIVATE Boost::geometry)
+# PROJ stays hidden behind crs::Transformer's pimpl (proj.h never appears in
+# a public header), so it's a private implementation detail too.
+target_link_libraries(Cartograph.Core PRIVATE PROJ::proj)
 
 if(BUILD_TESTING)
     add_subdirectory(tests)

@@ -9,6 +9,7 @@ add_executable(cartograph_core_tests
     test_simplify.cpp
     test_layer_cache.cpp
     test_thread_pool.cpp
+    test_crs_transformer.cpp
 )
 
 target_link_libraries(cartograph_core_tests PRIVATE Cartograph::Core Catch2::Catch2WithMain)

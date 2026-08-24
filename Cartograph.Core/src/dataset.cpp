@@ -5,10 +5,18 @@
 #include <ogrsf_frmts.h>
 
 #include <mutex>
+#include <optional>
+
+#include "cartograph/crs/transformer.h"
 
 namespace cartograph {
 
 namespace {
+
+// Every layer is normalized to this CRS at load time (see convertLayer),
+// so layers from different source CRSs render correctly aligned together
+// instead of each staying in its own native coordinate space.
+constexpr const char* kTargetCrs = "EPSG:4326";
 
 // proj.db ships next to the running executable (see CMakeLists.txt); PROJ
 // doesn't discover it there on its own. std::call_once (rather than a plain
@@ -79,36 +87,43 @@ GeometryType convertGeometryType(OGRwkbGeometryType type) {
     }
 }
 
-Ring convertRing(const OGRLinearRing& ring) {
+// transformer is null when the layer had no CRS metadata to reproject from
+// (see convertLayer) - points pass through unchanged in that case.
+Point2D makePoint(double x, double y, const crs::Transformer* transformer) {
+    const Point2D p{x, y};
+    return transformer != nullptr ? transformer->transform(p) : p;
+}
+
+Ring convertRing(const OGRLinearRing& ring, const crs::Transformer* transformer) {
     Ring result;
     result.reserve(static_cast<std::size_t>(ring.getNumPoints()));
     for (int i = 0; i < ring.getNumPoints(); ++i) {
-        result.push_back(Point2D{ring.getX(i), ring.getY(i)});
+        result.push_back(makePoint(ring.getX(i), ring.getY(i), transformer));
     }
     return result;
 }
 
-Ring convertLine(const OGRLineString& line) {
+Ring convertLine(const OGRLineString& line, const crs::Transformer* transformer) {
     Ring result;
     result.reserve(static_cast<std::size_t>(line.getNumPoints()));
     for (int i = 0; i < line.getNumPoints(); ++i) {
-        result.push_back(Point2D{line.getX(i), line.getY(i)});
+        result.push_back(makePoint(line.getX(i), line.getY(i), transformer));
     }
     return result;
 }
 
-Part convertPolygonPart(const OGRPolygon& polygon) {
+Part convertPolygonPart(const OGRPolygon& polygon, const crs::Transformer* transformer) {
     Part part;
     if (const OGRLinearRing* exterior = polygon.getExteriorRing()) {
-        part.push_back(convertRing(*exterior));
+        part.push_back(convertRing(*exterior, transformer));
     }
     for (int i = 0; i < polygon.getNumInteriorRings(); ++i) {
-        part.push_back(convertRing(*polygon.getInteriorRing(i)));
+        part.push_back(convertRing(*polygon.getInteriorRing(i), transformer));
     }
     return part;
 }
 
-Geometry convertGeometry(OGRGeometry* geom) {
+Geometry convertGeometry(OGRGeometry* geom, const crs::Transformer* transformer) {
     if (geom == nullptr) {
         return Geometry{};
     }
@@ -119,36 +134,36 @@ Geometry convertGeometry(OGRGeometry* geom) {
     switch (type) {
         case GeometryType::Point: {
             const auto* point = geom->toPoint();
-            parts.push_back(Part{Ring{Point2D{point->getX(), point->getY()}}});
+            parts.push_back(Part{Ring{makePoint(point->getX(), point->getY(), transformer)}});
             break;
         }
         case GeometryType::LineString: {
-            parts.push_back(Part{convertLine(*geom->toLineString())});
+            parts.push_back(Part{convertLine(*geom->toLineString(), transformer)});
             break;
         }
         case GeometryType::Polygon: {
-            parts.push_back(convertPolygonPart(*geom->toPolygon()));
+            parts.push_back(convertPolygonPart(*geom->toPolygon(), transformer));
             break;
         }
         case GeometryType::MultiPoint: {
             auto* multi = geom->toMultiPoint();
             for (int i = 0; i < multi->getNumGeometries(); ++i) {
                 const auto* point = multi->getGeometryRef(i)->toPoint();
-                parts.push_back(Part{Ring{Point2D{point->getX(), point->getY()}}});
+                parts.push_back(Part{Ring{makePoint(point->getX(), point->getY(), transformer)}});
             }
             break;
         }
         case GeometryType::MultiLineString: {
             auto* multi = geom->toMultiLineString();
             for (int i = 0; i < multi->getNumGeometries(); ++i) {
-                parts.push_back(Part{convertLine(*multi->getGeometryRef(i)->toLineString())});
+                parts.push_back(Part{convertLine(*multi->getGeometryRef(i)->toLineString(), transformer)});
             }
             break;
         }
         case GeometryType::MultiPolygon: {
             auto* multi = geom->toMultiPolygon();
             for (int i = 0; i < multi->getNumGeometries(); ++i) {
-                parts.push_back(convertPolygonPart(*multi->getGeometryRef(i)->toPolygon()));
+                parts.push_back(convertPolygonPart(*multi->getGeometryRef(i)->toPolygon(), transformer));
             }
             break;
         }
@@ -167,6 +182,27 @@ Layer convertLayer(OGRLayer& ogrLayer) {
         fields.push_back(FieldDef{fieldDefn->GetNameRef(), convertFieldType(fieldDefn->GetType())});
     }
 
+    // WKT2 (not exportToPrettyWkt's default WKT1) - PROJ's own native,
+    // unambiguous format. Shapefiles' .prj sidecars are very often
+    // ESRI-flavored WKT1 (e.g. "GCS_WGS_1984"/"D_WGS_1984" naming), which
+    // GDAL parses fine but raw PROJ's proj_create() (used by
+    // crs::Transformer below) can reject outright - WKT2 round-trips
+    // cleanly through PROJ regardless of the source .prj's original dialect.
+    std::string sourceCrsWkt;
+    if (const OGRSpatialReference* srs = ogrLayer.GetSpatialRef()) {
+        const char* const wktOptions[] = {"FORMAT=WKT2", nullptr};
+        sourceCrsWkt = srs->exportToWkt(wktOptions);
+    }
+
+    // No transformer (geometry passes through unchanged) when the layer has
+    // no CRS metadata at all - there's no legitimate source CRS to
+    // transform from.
+    std::optional<crs::Transformer> transformer;
+    if (!sourceCrsWkt.empty()) {
+        transformer.emplace(sourceCrsWkt, kTargetCrs);
+    }
+    const crs::Transformer* transformerPtr = transformer ? &*transformer : nullptr;
+
     std::vector<Feature> features;
     ogrLayer.ResetReading();
     for (auto& ogrFeature : ogrLayer) {
@@ -175,28 +211,24 @@ Layer convertLayer(OGRLayer& ogrLayer) {
         for (std::size_t i = 0; i < fields.size(); ++i) {
             attributes.push_back(convertFieldValue(*ogrFeature, static_cast<int>(i), fields[i].type));
         }
-        features.emplace_back(ogrFeature->GetFID(), convertGeometry(ogrFeature->GetGeometryRef()),
+        features.emplace_back(ogrFeature->GetFID(), convertGeometry(ogrFeature->GetGeometryRef(), transformerPtr),
                                std::move(attributes));
     }
 
+    // Computed from the (already-reprojected) features rather than
+    // ogrLayer.GetExtent()'s native-CRS bbox, which would be wrong once
+    // geometry has moved to kTargetCrs.
     Envelope extent;
-    OGREnvelope ogrExtent;
-    if (ogrLayer.GetExtent(&ogrExtent) == OGRERR_NONE) {
-        extent.expand(Point2D{ogrExtent.MinX, ogrExtent.MinY});
-        extent.expand(Point2D{ogrExtent.MaxX, ogrExtent.MaxY});
+    for (const Feature& feature : features) {
+        extent.expand(feature.geometry().extent());
     }
 
-    std::string crsWkt;
-    if (const OGRSpatialReference* srs = ogrLayer.GetSpatialRef()) {
-        char* wkt = nullptr;
-        srs->exportToPrettyWkt(&wkt);
-        if (wkt != nullptr) {
-            crsWkt = wkt;
-            CPLFree(wkt);
-        }
-    }
+    // Reports the CRS the coordinates are actually in: kTargetCrs if a
+    // transform was applied, or empty if the layer had no CRS metadata to
+    // begin with (honest "unknown", not a false claim it's in kTargetCrs).
+    const std::string crsWkt = transformerPtr != nullptr ? kTargetCrs : std::string();
 
-    return Layer{ogrLayer.GetName(), std::move(fields), std::move(features), extent, std::move(crsWkt)};
+    return Layer{ogrLayer.GetName(), std::move(fields), std::move(features), extent, crsWkt};
 }
 
 }  // namespace
