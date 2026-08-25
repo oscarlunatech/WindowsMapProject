@@ -5,7 +5,7 @@
 #include <string>
 #include <variant>
 
-#include "cartograph/dataset.h"
+#include "cartograph/map.h"
 #include "cartograph/style/style_spec.h"
 #include "cartograph/style/stylesheet.h"
 
@@ -18,17 +18,17 @@ std::string fixturePath(const std::string& name) {
     return std::string(CARTOGRAPH_TEST_FIXTURES_DIR) + "/" + name;
 }
 
-const Dataset& countries() {
+const Map& countries() {
     // Dataset's constructor is private (only Dataset::open builds one), so
-    // these tests bind against the real fixture rather than a synthetic
-    // dataset. Opened once - it's the same read-only data for every case.
-    static const Dataset dataset = Dataset::open(fixturePath("ne_110m_admin_0_countries.shp"));
-    return dataset;
+    // these tests bind against the real fixture rather than a synthetic map.
+    // Opened once - it's the same read-only data for every case.
+    static const Map map = Map::open(fixturePath("ne_110m_admin_0_countries.shp"));
+    return map;
 }
 
 // Index of the first feature whose CONTINENT attribute equals name.
 std::size_t firstFeatureInContinent(const std::string& name) {
-    const Layer& layer = countries().layers().front();
+    const Layer& layer = countries().layers().front().layer();
     std::size_t continentField = 0;
     for (std::size_t i = 0; i < layer.fields().size(); ++i) {
         if (layer.fields()[i].name == "CONTINENT") {
@@ -69,13 +69,13 @@ TEST_CASE("Default symbol reproduces the pre-Phase-7 hardcoded styling", "[style
 TEST_CASE("Default stylesheet resolves every feature to one shared symbol", "[style]") {
     const Stylesheet sheet = Stylesheet::defaults(countries());
 
-    // One symbol for the whole dataset is what lets drawDatasetCulled keep
+    // One symbol for the whole map is what lets drawMapCulled keep
     // batching a layer into a single geometry, exactly as it did pre-Phase-7.
     REQUIRE(sheet.symbolCount() == 1);
     REQUIRE(sheet.symbol(0) == Symbol{});
     REQUIRE(sheet.layerCount() == countries().layers().size());
 
-    for (std::size_t f = 0; f < countries().layers().front().features().size(); ++f) {
+    for (std::size_t f = 0; f < countries().layers().front().layer().features().size(); ++f) {
         REQUIRE(sheet.symbolIndex(0, f) == 0);
     }
 }
@@ -122,7 +122,7 @@ TEST_CASE("Categorized style matches numbers across OGR's integer and real types
     const Stylesheet sheet(spec, countries());
 
     bool anyMatched = false;
-    for (std::size_t f = 0; f < countries().layers().front().features().size(); ++f) {
+    for (std::size_t f = 0; f < countries().layers().front().layer().features().size(); ++f) {
         if (sheet.symbol(sheet.symbolIndex(0, f)) == matched) {
             anyMatched = true;
             break;
@@ -140,7 +140,7 @@ TEST_CASE("Categorized style rejects an unknown field", "[style]") {
     REQUIRE_THROWS_AS(Stylesheet(spec, countries()), StyleError);
 }
 
-TEST_CASE("Stylesheet rejects a layer name the dataset doesn't have", "[style]") {
+TEST_CASE("Stylesheet rejects a layer name the map doesn't have", "[style]") {
     StyleSpec spec;
     spec.byLayerName.emplace("roads", SingleSymbol{});
     REQUIRE_THROWS_AS(Stylesheet(spec, countries()), StyleError);
@@ -189,7 +189,7 @@ TEST_CASE("Graduated style rejects a string field", "[style]") {
 
 TEST_CASE("Identical symbols are deduplicated into one table entry", "[style]") {
     // Two categories that happen to look the same must not produce two batch
-    // keys, or drawDatasetCulled would split one draw call into two for no
+    // keys, or drawMapCulled would split one draw call into two for no
     // visible reason.
     Categorized categorized;
     categorized.field = "CONTINENT";

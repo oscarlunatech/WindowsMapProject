@@ -22,13 +22,13 @@ std::string joinFieldNames(const std::vector<FieldDef>& fields) {
     return joined.empty() ? "(none)" : joined;
 }
 
-std::string joinLayerNames(const Dataset& dataset) {
+std::string joinLayerNames(const Map& map) {
     std::string joined;
-    for (const Layer& layer : dataset.layers()) {
+    for (const MapLayer& mapLayer : map.layers()) {
         if (!joined.empty()) {
             joined += ", ";
         }
-        joined += layer.name();
+        joined += mapLayer.layer().name();
     }
     return joined.empty() ? "(none)" : joined;
 }
@@ -169,35 +169,37 @@ std::vector<std::uint32_t> resolveLayer(std::vector<Symbol>& symbols, const Laye
 
 }  // namespace
 
-Stylesheet Stylesheet::defaults(const Dataset& dataset) {
+Stylesheet Stylesheet::defaults(const Map& map) {
     StyleSpec spec;
     spec.defaultStyle = SingleSymbol{};
-    return Stylesheet(spec, dataset);
+    return Stylesheet(spec, map);
 }
 
-Stylesheet::Stylesheet(const StyleSpec& spec, const Dataset& dataset) {
-    // Report a style file naming a layer this dataset doesn't have. It's
-    // almost always a typo, and quietly drawing the default instead is
+Stylesheet::Stylesheet(const StyleSpec& spec, const Map& map) {
+    // Report a style file naming a layer this map doesn't have. It's almost
+    // always a typo, and quietly drawing the default instead is
     // indistinguishable from the style file not being read at all.
     for (const auto& [layerName, layerStyle] : spec.byLayerName) {
-        const bool exists = std::any_of(dataset.layers().begin(), dataset.layers().end(),
-                                         [&layerName](const Layer& l) { return l.name() == layerName; });
+        const bool exists =
+            std::any_of(map.layers().begin(), map.layers().end(),
+                         [&layerName](const MapLayer& l) { return l.layer().name() == layerName; });
         if (!exists) {
-            throw StyleError(std::format("style names layer '{}', which this dataset doesn't have (available: {})",
-                                          layerName, joinLayerNames(dataset)));
+            throw StyleError(std::format("style names layer '{}', which this map doesn't have (available: {})",
+                                          layerName, joinLayerNames(map)));
         }
     }
 
     const LayerStyle fallbackStyle = spec.defaultStyle.value_or(LayerStyle{SingleSymbol{}});
 
-    symbolIndexByFeature_.reserve(dataset.layers().size());
-    for (const Layer& layer : dataset.layers()) {
+    symbolIndexByFeature_.reserve(map.layers().size());
+    for (const MapLayer& mapLayer : map.layers()) {
+        const Layer& layer = mapLayer.layer();
         const auto it = spec.byLayerName.find(layer.name());
         const LayerStyle& style = it != spec.byLayerName.end() ? it->second : fallbackStyle;
         symbolIndexByFeature_.push_back(resolveLayer(symbols_, layer, style));
     }
 
-    // A dataset with no layers would otherwise leave an empty symbol table;
+    // A map with no layers would otherwise leave an empty symbol table;
     // keep at least one so symbol(0) is always a valid call.
     if (symbols_.empty()) {
         symbols_.push_back(Symbol{});

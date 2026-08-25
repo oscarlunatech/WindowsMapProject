@@ -4,13 +4,13 @@
 #include <cstdint>
 #include <vector>
 
-#include "cartograph/dataset.h"
+#include "cartograph/map.h"
 #include "cartograph/style/style_spec.h"
 #include "cartograph/style/symbol.h"
 
 namespace cartograph::style {
 
-// A StyleSpec bound to one concrete Dataset: layer names resolved to layer
+// A StyleSpec bound to one concrete Map: layer names resolved to layer
 // indices, field names resolved to field indices, and - the real point of the
 // class - every feature's symbol resolved once, at construction, into a flat
 // lookup table.
@@ -35,13 +35,18 @@ class Stylesheet {
 public:
     // Every layer drawn with a default-constructed Symbol - i.e. exactly the
     // styling renderer.cpp hardcoded before Phase 7 existed.
-    static Stylesheet defaults(const Dataset& dataset);
+    static Stylesheet defaults(const Map& map);
 
-    // Throws StyleError if spec names a layer or a field this dataset doesn't
+    // Throws StyleError if spec names a layer or a field this map doesn't
     // have (a typo in a hand-written style file is worth reporting, since
     // silently falling back would look exactly like the file being ignored),
     // or if a graduated renderer targets a non-numeric field.
-    Stylesheet(const StyleSpec& spec, const Dataset& dataset);
+    //
+    // Styles are matched by layer *name*, so if two files in the map happen to
+    // contain a layer of the same name they deliberately share a style - which
+    // is what you want for e.g. 21 counties' worth of identically-shaped road
+    // layers, and is also what the style file's "default" key is for.
+    Stylesheet(const StyleSpec& spec, const Map& map);
 
     std::size_t symbolCount() const { return symbols_.size(); }
     const std::vector<Symbol>& symbols() const { return symbols_; }

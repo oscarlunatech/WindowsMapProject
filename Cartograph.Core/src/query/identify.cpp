@@ -7,12 +7,8 @@
 
 namespace cartograph::query {
 
-std::vector<Hit> identify(const Dataset& dataset, const std::vector<render::LayerCache>& layerCaches,
-                           Point2D mapPoint, double tolerance) {
-    const std::vector<Layer>& layers = dataset.layers();
-    const std::size_t layerCount = (std::min)(layers.size(), layerCaches.size());
-
-    // The R-tree stores feature extents, so widen the probe point into a
+std::vector<Hit> identify(const Map& map, Point2D mapPoint, double tolerance) {
+    // The cache stores feature extents, so widen the probe point into a
     // tolerance-sized box before querying: a feature can be within tolerance
     // of the point while its extent doesn't contain the point itself.
     Envelope probe;
@@ -20,17 +16,17 @@ std::vector<Hit> identify(const Dataset& dataset, const std::vector<render::Laye
     probe.expand(Point2D{mapPoint.x + tolerance, mapPoint.y + tolerance});
 
     std::vector<Hit> hits;
-    for (std::size_t layerIndex = 0; layerIndex < layerCount; ++layerIndex) {
-        const std::vector<Feature>& features = layers[layerIndex].features();
+    for (std::size_t layerIndex = 0; layerIndex < map.layers().size(); ++layerIndex) {
+        const MapLayer& mapLayer = map.layers()[layerIndex];
+        if (!mapLayer.visible()) {
+            continue;
+        }
+        const std::vector<Feature>& features = mapLayer.layer().features();
 
-        for (const std::size_t featureIndex : layerCaches[layerIndex].query(probe)) {
+        for (const std::size_t featureIndex : mapLayer.cache().query(probe)) {
             if (featureIndex >= features.size()) {
                 continue;
             }
-            // Exact test against the *original* geometry, not the simplified
-            // geometry the renderer draws - identify should answer about the
-            // real data, not about whatever the current zoom happened to
-            // round it to.
             const double distance = geom::distanceTo(features[featureIndex].geometry(), mapPoint);
             if (distance <= tolerance) {
                 hits.push_back(Hit{layerIndex, featureIndex, distance});

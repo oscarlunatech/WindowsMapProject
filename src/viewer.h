@@ -11,31 +11,29 @@
 #include <thread>
 #include <vector>
 
-#include "cartograph/dataset.h"
 #include "cartograph/jobs/thread_pool.h"
-#include "cartograph/render/layer_cache.h"
+#include "cartograph/map.h"
 #include "cartograph/render/viewport.h"
 #include "cartograph/style/stylesheet.h"
 
-// Opens a live Win32 window rendering a Dataset with mouse pan, scroll-wheel
-// zoom, keyboard nav, and a frame-timing overlay. Deliberately outside
-// Cartograph.Core - the core knows nothing about windows or message loops;
-// it only supplies drawDatasetCulled() (see cartograph/render/renderer.h),
-// which this class calls into every frame using a LayerCache built once per
-// layer at startup.
+// Opens a live Win32 window rendering a Map with mouse pan, scroll-wheel
+// zoom, click-to-identify, keyboard nav, and a frame-timing overlay.
+// Deliberately outside Cartograph.Core - the core knows nothing about windows
+// or message loops; it only supplies drawMapCulled() (see
+// cartograph/render/renderer.h), which this class calls every frame.
 //
-// The dataset itself is opened and its LayerCaches built on a background
-// thread (loaderThread_) so the window appears immediately instead of
-// blocking on Dataset::open() - see loadInBackground() in viewer.cpp. pool_
-// serves both that one-off load and the per-frame parallel layer-prep work
-// inside drawDatasetCulled.
+// The map is opened on a background thread (loaderThread_) so the window
+// appears immediately instead of blocking on Map::open() - see
+// loadInBackground() in viewer.cpp. pool_ serves both that one-off load and
+// the per-frame parallel layer-prep work inside drawMapCulled.
 class Viewer {
 public:
-    // stylePath is a JSON style file (see cartograph/style/style_spec.h), or
-    // empty for the built-in default symbology. It's read and bound to the
-    // dataset on loaderThread_ along with everything else, since
-    // style::Stylesheet's constructor is O(features).
-    explicit Viewer(std::string path, std::string stylePath = {});
+    // paths stack as layers, first path at the bottom. stylePath is a JSON
+    // style file (see cartograph/style/style_spec.h), or empty for the
+    // built-in default symbology; it's read and bound to the map on
+    // loaderThread_ along with everything else, since style::Stylesheet's
+    // constructor is O(features).
+    explicit Viewer(std::vector<std::string> paths, std::string stylePath = {});
     ~Viewer();
 
     Viewer(const Viewer&) = delete;
@@ -61,17 +59,16 @@ private:
 
     cartograph::render::Viewport currentViewport() const;
 
-    std::string datasetPath_;
+    std::vector<std::string> datasetPaths_;
     std::string stylePath_;  // empty means default symbology
     cartograph::jobs::ThreadPool pool_;
     std::thread loaderThread_;
     LoadState loadState_ = LoadState::Loading;
     std::wstring loadMessage_;  // overlay text while loadState_ != Ready; set in the constructor and on failure
 
-    std::optional<cartograph::Dataset> dataset_;  // engaged once loadState_ == Ready
+    std::optional<cartograph::Map> map_;                       // engaged once loadState_ == Ready
     std::size_t totalFeatureCount_ = 0;
-    std::vector<cartograph::render::LayerCache> layerCaches_;  // one per dataset_->layers(), built once
-    std::optional<cartograph::style::Stylesheet> stylesheet_;  // engaged alongside dataset_, built once
+    std::optional<cartograph::style::Stylesheet> stylesheet_;  // engaged alongside map_, built once
     cartograph::Envelope mapExtent_;
     cartograph::render::ScreenSize screenSize_{1024, 768};
 

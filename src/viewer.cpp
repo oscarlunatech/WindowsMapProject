@@ -15,11 +15,10 @@
 #include "cartograph/query/identify.h"
 #include "cartograph/render/renderer.h"
 
-using cartograph::Dataset;
 using cartograph::Envelope;
 using cartograph::Layer;
+using cartograph::Map;
 using cartograph::Point2D;
-using cartograph::render::LayerCache;
 using cartograph::render::RenderError;
 using cartograph::render::ScreenSize;
 using cartograph::render::Viewport;
@@ -72,19 +71,25 @@ constexpr UINT kMsgDatasetLoaded = WM_APP + 1;
 // are written exclusively by the UI thread, in handleMessage below, once it
 // takes ownership of this struct out of the message's LPARAM.
 struct LoadResult {
-    std::optional<Dataset> dataset;
-    std::vector<LayerCache> layerCaches;
+    std::optional<Map> map;
     std::optional<cartograph::style::Stylesheet> stylesheet;
     Envelope extent;
     std::size_t featureCount = 0;
-    std::wstring errorMessage;  // engaged only when dataset is nullopt
+    std::wstring errorMessage;  // engaged only when map is nullopt
 };
+
+std::wstring describePaths(const std::vector<std::string>& paths) {
+    if (paths.size() == 1) {
+        return widen(paths.front());
+    }
+    return std::to_wstring(paths.size()) + L" datasets";
+}
 
 }  // namespace
 
-Viewer::Viewer(std::string path, std::string stylePath)
-    : datasetPath_(std::move(path)), stylePath_(std::move(stylePath)) {
-    loadMessage_ = L"Loading " + widen(datasetPath_) + L"...";
+Viewer::Viewer(std::vector<std::string> paths, std::string stylePath)
+    : datasetPaths_(std::move(paths)), stylePath_(std::move(stylePath)) {
+    loadMessage_ = L"Loading " + describePaths(datasetPaths_) + L"...";
 }
 
 Viewer::~Viewer() {
@@ -127,17 +132,13 @@ void Viewer::run() {
 void Viewer::loadInBackground(HWND hwnd) {
     auto result = std::make_unique<LoadResult>();
     try {
-        Dataset dataset = Dataset::open(datasetPath_);
-        const Envelope extent = dataset.extent();
-        std::size_t featureCount = 0;
-        for (const Layer& layer : dataset.layers()) {
-            featureCount += layer.features().size();
-        }
-
-        // buildLayerCachesParallel captures const Layer& references into
-        // dataset's own layers while it builds each LayerCache concurrently
-        // on pool_ - dataset must not move until that call returns.
-        std::vector<LayerCache> caches = cartograph::render::buildLayerCachesParallel(pool_, dataset.layers());
+        // Map::open opens each path and builds every layer's R-tree and
+        // simplification buckets, fanned across pool_. Safe to use pool_ from
+        // here because loaderThread_ is a dedicated thread, not a pool worker -
+        // see the no-nested-submission rule in thread_pool.h.
+        Map map = Map::open(datasetPaths_, pool_);
+        const Envelope extent = map.extent();
+        const std::size_t featureCount = map.featureCount();
 
         // Resolving every feature's symbol is O(features), so it belongs here
         // on the loader thread with the rest of the load - not in onPaint. A
@@ -145,11 +146,10 @@ void Viewer::loadInBackground(HWND hwnd) {
         // dataset path.
         cartograph::style::Stylesheet stylesheet =
             stylePath_.empty()
-                ? cartograph::style::Stylesheet::defaults(dataset)
-                : cartograph::style::Stylesheet(cartograph::style::loadStyleSpec(stylePath_), dataset);
+                ? cartograph::style::Stylesheet::defaults(map)
+                : cartograph::style::Stylesheet(cartograph::style::loadStyleSpec(stylePath_), map);
 
-        result->dataset = std::move(dataset);
-        result->layerCaches = std::move(caches);
+        result->map = std::move(map);
         result->stylesheet = std::move(stylesheet);
         result->extent = extent;
         result->featureCount = featureCount;
@@ -216,16 +216,16 @@ LRESULT Viewer::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
         case kMsgDatasetLoaded: {
             std::unique_ptr<LoadResult> result(reinterpret_cast<LoadResult*>(lParam));
-            if (result->dataset) {
-                dataset_ = std::move(result->dataset);
-                layerCaches_ = std::move(result->layerCaches);
+            if (result->map) {
+                map_ = std::move(result->map);
                 stylesheet_ = std::move(result->stylesheet);
                 totalFeatureCount_ = result->featureCount;
                 mapExtent_ = result->extent;
                 loadState_ = LoadState::Ready;
             } else {
                 loadState_ = LoadState::Failed;
-                loadMessage_ = L"Failed to load " + widen(datasetPath_) + L": " + result->errorMessage;
+                loadMessage_ =
+                    L"Failed to load " + describePaths(datasetPaths_) + L": " + result->errorMessage;
             }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
@@ -298,9 +298,8 @@ void Viewer::onPaint(HWND hwnd) {
         QueryPerformanceFrequency(&freq);
         QueryPerformanceCounter(&start);
 
-        const std::size_t drawnCount =
-            cartograph::render::drawDatasetCulled(*renderTarget_.Get(), *d2dFactory_.Get(), *dataset_,
-                                                   layerCaches_, currentViewport(), pool_, *stylesheet_);
+        const std::size_t drawnCount = cartograph::render::drawMapCulled(
+            *renderTarget_.Get(), *d2dFactory_.Get(), *map_, currentViewport(), pool_, *stylesheet_);
 
         QueryPerformanceCounter(&end);
         const double ms =
@@ -381,8 +380,7 @@ void Viewer::onClick(POINT clientPos) {
     const double tolerance =
         viewport.scale() > 0.0 ? kIdentifyRadiusPixels / viewport.scale() : 0.0;
 
-    const std::vector<cartograph::query::Hit> hits =
-        cartograph::query::identify(*dataset_, layerCaches_, mapPoint, tolerance);
+    const std::vector<cartograph::query::Hit> hits = cartograph::query::identify(*map_, mapPoint, tolerance);
 
     if (hits.empty()) {
         identifyText_ = L"identify: nothing here";
@@ -390,7 +388,7 @@ void Viewer::onClick(POINT clientPos) {
     }
 
     const cartograph::query::Hit& hit = hits.front();
-    const Layer& layer = dataset_->layers()[hit.layerIndex];
+    const Layer& layer = map_->layers()[hit.layerIndex].layer();
     const cartograph::Feature& feature = layer.features()[hit.featureIndex];
 
     std::wstring text = widen(layer.name()) + L"  feature " + std::to_wstring(feature.id());

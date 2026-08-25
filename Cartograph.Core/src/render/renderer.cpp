@@ -273,13 +273,30 @@ std::vector<SymbolBrushes> createSymbolBrushes(ID2D1RenderTarget& target, const 
     return brushes;
 }
 
-// A stylesheet built against a different dataset would index out of bounds in
-// the hot loop; catch the mix-up at the call boundary instead.
-void requireStylesheetMatches(const Dataset& dataset, const style::Stylesheet& stylesheet) {
-    if (stylesheet.layerCount() != dataset.layers().size()) {
-        throw RenderError("stylesheet was built against a different dataset (" +
+// A stylesheet built against a different map would index out of bounds in the
+// hot loop; catch the mix-up at the call boundary instead.
+void requireStylesheetMatches(const Map& map, const style::Stylesheet& stylesheet) {
+    if (stylesheet.layerCount() != map.layers().size()) {
+        throw RenderError("stylesheet was built against a different map (" +
                           std::to_string(stylesheet.layerCount()) + " layers vs " +
-                          std::to_string(dataset.layers().size()) + ")");
+                          std::to_string(map.layers().size()) + ")");
+    }
+}
+
+// Layer opacity is applied by setting it on the brushes for the duration of
+// that layer, rather than by pushing an ID2D1Layer. PushLayer would give true
+// group opacity (overlapping features within one layer compositing as a unit)
+// at the cost of an intermediate surface per layer, which on a 21-layer map is
+// a lot to pay every frame. Setting brush opacity composites each feature
+// separately instead - visibly different only where features inside the same
+// layer overlap each other, which for the layer stacks this viewer targets is
+// a good trade. Revisit if a use case needs the exact semantics.
+void setBrushOpacity(const std::vector<SymbolBrushes>& brushes, float opacity) {
+    for (const SymbolBrushes& symbolBrushes : brushes) {
+        symbolBrushes.fill->SetOpacity(opacity);
+        symbolBrushes.polygonStroke->SetOpacity(opacity);
+        symbolBrushes.lineStroke->SetOpacity(opacity);
+        symbolBrushes.pointFill->SetOpacity(opacity);
     }
 }
 
@@ -327,14 +344,19 @@ void drawGeometry(ID2D1Factory& factory, ID2D1RenderTarget& target, const Viewpo
 
 }  // namespace
 
-void drawDataset(ID2D1RenderTarget& target, ID2D1Factory& factory, const Dataset& dataset,
-                  const Viewport& viewport, const style::Stylesheet& stylesheet) {
-    requireStylesheetMatches(dataset, stylesheet);
+void drawMap(ID2D1RenderTarget& target, ID2D1Factory& factory, const Map& map, const Viewport& viewport,
+              const style::Stylesheet& stylesheet) {
+    requireStylesheetMatches(map, stylesheet);
     const std::vector<SymbolBrushes> brushes = createSymbolBrushes(target, stylesheet);
 
-    const std::vector<Layer>& layers = dataset.layers();
-    for (std::size_t layerIdx = 0; layerIdx < layers.size(); ++layerIdx) {
-        const std::vector<Feature>& features = layers[layerIdx].features();
+    for (std::size_t layerIdx = 0; layerIdx < map.layers().size(); ++layerIdx) {
+        const MapLayer& mapLayer = map.layers()[layerIdx];
+        if (!mapLayer.visible()) {
+            continue;
+        }
+        setBrushOpacity(brushes, mapLayer.opacity());
+
+        const std::vector<Feature>& features = mapLayer.layer().features();
         for (std::size_t featureIdx = 0; featureIdx < features.size(); ++featureIdx) {
             const std::size_t symbolIdx = stylesheet.symbolIndex(layerIdx, featureIdx);
             drawGeometry(factory, target, viewport, stylesheet.symbol(symbolIdx), brushes[symbolIdx],
@@ -343,22 +365,19 @@ void drawDataset(ID2D1RenderTarget& target, ID2D1Factory& factory, const Dataset
     }
 }
 
-void drawDataset(ID2D1RenderTarget& target, ID2D1Factory& factory, const Dataset& dataset,
-                  const Viewport& viewport) {
-    drawDataset(target, factory, dataset, viewport, style::Stylesheet::defaults(dataset));
+void drawMap(ID2D1RenderTarget& target, ID2D1Factory& factory, const Map& map, const Viewport& viewport) {
+    drawMap(target, factory, map, viewport, style::Stylesheet::defaults(map));
 }
 
-std::size_t drawDatasetCulled(ID2D1RenderTarget& target, ID2D1Factory& factory, const Dataset& dataset,
-                               const std::vector<LayerCache>& layerCaches, const Viewport& viewport,
-                               jobs::ThreadPool& pool, const style::Stylesheet& stylesheet) {
-    requireStylesheetMatches(dataset, stylesheet);
+std::size_t drawMapCulled(ID2D1RenderTarget& target, ID2D1Factory& factory, const Map& map,
+                           const Viewport& viewport, jobs::ThreadPool& pool,
+                           const style::Stylesheet& stylesheet) {
+    requireStylesheetMatches(map, stylesheet);
     const std::vector<SymbolBrushes> brushes = createSymbolBrushes(target, stylesheet);
     const double mapUnitsPerPixel = viewport.scale() > 0.0 ? 1.0 / viewport.scale() : 0.0;
     const Envelope viewExtent = viewport.mapExtent();
 
-    // Parenthesized (std::min) - see the comment on ThreadPool's constructor
-    // in thread_pool.h for why, in a TU that also includes windows.h.
-    const std::size_t layerCount = (std::min)(dataset.layers().size(), layerCaches.size());
+    const std::size_t layerCount = map.layers().size();
 
     // Phase 1 (parallel): query + simplify + transform + build each layer's
     // ID2D1PathGeometry resources. Safe on pool workers because factory is
@@ -379,11 +398,17 @@ std::size_t drawDatasetCulled(ID2D1RenderTarget& target, ID2D1Factory& factory, 
     for (std::size_t chunk = 0; chunk < chunkCount; ++chunk) {
         const std::size_t begin = layerCount * chunk / chunkCount;
         const std::size_t end = layerCount * (chunk + 1) / chunkCount;
-        futures.push_back(pool.submit([&factory, &layerCaches, &viewport, mapUnitsPerPixel, viewExtent, &prepared,
+        futures.push_back(pool.submit([&factory, &map, &viewport, mapUnitsPerPixel, viewExtent, &prepared,
                                         &stylesheet, begin, end] {
             for (std::size_t layerIdx = begin; layerIdx < end; ++layerIdx) {
-                prepared[layerIdx] = prepareLayer(factory, layerCaches[layerIdx], viewport, mapUnitsPerPixel,
-                                                   viewExtent, stylesheet, layerIdx);
+                // Hidden layers cost nothing: no query, no simplification, no
+                // geometry built, and prepared[layerIdx] stays empty so phase
+                // 2 below skips it too.
+                if (!map.layers()[layerIdx].visible()) {
+                    continue;
+                }
+                prepared[layerIdx] = prepareLayer(factory, map.layers()[layerIdx].cache(), viewport,
+                                                   mapUnitsPerPixel, viewExtent, stylesheet, layerIdx);
             }
         }));
     }
@@ -397,8 +422,13 @@ std::size_t drawDatasetCulled(ID2D1RenderTarget& target, ID2D1Factory& factory, 
     // to touch it. Cheap relative to phase 1 now that the sink-writing
     // (BeginFigure/AddLine per point) happened in parallel above.
     std::size_t drawnCount = 0;
-    for (const PreparedLayer& layer : prepared) {
-        drawnCount += layer.visibleCount;
+    for (std::size_t layerIdx = 0; layerIdx < prepared.size(); ++layerIdx) {
+        const PreparedLayer& layer = prepared[layerIdx];
+        drawnCount += layer.visibleCount;  // 0 for a hidden layer, which prepares nothing
+        if (layer.batches.empty()) {
+            continue;
+        }
+        setBrushOpacity(brushes, map.layers()[layerIdx].opacity());
 
         for (const PreparedBatch& batch : layer.batches) {
             const style::Symbol& symbol = stylesheet.symbol(batch.symbolIndex);
@@ -430,9 +460,9 @@ std::size_t drawDatasetCulled(ID2D1RenderTarget& target, ID2D1Factory& factory, 
 OffscreenTarget::OffscreenTarget(ScreenSize size) {
     const ComPtr<IWICImagingFactory> wicFactory = createWicFactory();
 
-    // MULTI_THREADED: shared by Renderer::render (drawDataset, single-
-    // threaded regardless - unaffected) and bench --culled (drawDatasetCulled,
-    // which needs it - see renderer.h).
+    // MULTI_THREADED: shared by Renderer::render (drawMap, single-threaded
+    // regardless - unaffected) and bench --culled (drawMapCulled, which needs
+    // it - see renderer.h).
     throwIfFailed(D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, d2dFactory_.GetAddressOf()),
                   "D2D1CreateFactory");
 
@@ -457,17 +487,17 @@ void OffscreenTarget::endFrame() {
     throwIfFailed(renderTarget_->EndDraw(), "ID2D1RenderTarget::EndDraw");
 }
 
-ComPtr<IWICBitmap> Renderer::render(const Dataset& dataset, const Viewport& viewport,
+ComPtr<IWICBitmap> Renderer::render(const Map& map, const Viewport& viewport,
                                      const style::Stylesheet& stylesheet) {
     OffscreenTarget target(viewport.screenSize());
     target.beginFrame();
-    drawDataset(target.renderTarget(), target.factory(), dataset, viewport, stylesheet);
+    drawMap(target.renderTarget(), target.factory(), map, viewport, stylesheet);
     target.endFrame();
     return target.bitmap();
 }
 
-ComPtr<IWICBitmap> Renderer::render(const Dataset& dataset, const Viewport& viewport) {
-    return render(dataset, viewport, style::Stylesheet::defaults(dataset));
+ComPtr<IWICBitmap> Renderer::render(const Map& map, const Viewport& viewport) {
+    return render(map, viewport, style::Stylesheet::defaults(map));
 }
 
 void savePng(IWICBitmap* bitmap, const std::string& path) {

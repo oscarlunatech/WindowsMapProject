@@ -5,6 +5,7 @@ find_package(nlohmann_json CONFIG REQUIRED)
 add_library(Cartograph.Core STATIC
     src/geometry.cpp
     src/dataset.cpp
+    src/map.cpp
     src/index/spatial_index.cpp
     src/geom/simplify.cpp
     src/geom/predicates.cpp

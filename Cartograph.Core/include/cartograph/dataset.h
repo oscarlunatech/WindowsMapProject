@@ -23,6 +23,11 @@ public:
 
     const std::vector<Layer>& layers() const { return layers_; }
 
+    // Moves the layers out, leaving this Dataset empty. Map uses this to take
+    // ownership at load time - a Dataset is the loader, not the thing that
+    // gets drawn, so nothing needs it to stay populated afterwards.
+    std::vector<Layer> takeLayers() { return std::move(layers_); }
+
     // Union of every layer's extent.
     Envelope extent() const;
 
