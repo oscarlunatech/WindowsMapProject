@@ -54,6 +54,7 @@ private:
     void onResize(UINT width, UINT height);
     void onMouseMove(POINT clientPos);
     void onMouseWheel(short wheelDelta, POINT clientPos);
+    void onClick(POINT clientPos);  // a left-button press+release that didn't pan
     void onKeyDown(WPARAM key);
     void zoomAt(cartograph::Point2D anchorMap, double factor);
     void loadInBackground(HWND hwnd);  // runs on loaderThread_
@@ -81,5 +82,8 @@ private:
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> overlayBrush_;
 
     bool dragging_ = false;
+    bool dragMoved_ = false;  // distinguishes a click (identify) from a drag (pan)
     POINT lastMousePos_{};
+
+    std::wstring identifyText_;  // overlay text from the last click; empty until one happens
 };

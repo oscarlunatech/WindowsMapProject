@@ -7,6 +7,8 @@ add_library(Cartograph.Core STATIC
     src/dataset.cpp
     src/index/spatial_index.cpp
     src/geom/simplify.cpp
+    src/geom/predicates.cpp
+    src/query/identify.cpp
     src/render/viewport.cpp
     src/render/renderer.cpp
     src/render/layer_cache.cpp

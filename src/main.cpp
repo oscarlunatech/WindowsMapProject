@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <format>
 #include <fstream>
@@ -16,6 +17,7 @@
 
 #include "cartograph/dataset.h"
 #include "cartograph/jobs/thread_pool.h"
+#include "cartograph/query/identify.h"
 #include "cartograph/render/renderer.h"
 #include "cartograph/style/stylesheet.h"
 #include "viewer.h"
@@ -72,6 +74,56 @@ int runDump(const std::string& path, std::size_t limit) {
             }
             ++count;
         }
+    }
+    return 0;
+}
+
+Point2D parsePoint(const std::string& text) {
+    const auto comma = text.find(',');
+    if (comma == std::string::npos) {
+        throw std::invalid_argument("--at must be x,y");
+    }
+    return Point2D{std::stod(text.substr(0, comma)), std::stod(text.substr(comma + 1))};
+}
+
+// With no window there's no pixel size to derive a click tolerance from, so
+// scale it to the data instead: 0.1% of the dataset extent's diagonal. Same
+// trick LayerCache uses to pick its simplification tolerance buckets.
+double defaultTolerance(const Envelope& extent) {
+    if (!extent.valid) {
+        return 0.0;
+    }
+    return 0.001 * std::hypot(extent.width(), extent.height());
+}
+
+int runIdentify(const std::string& path, Point2D at, std::optional<double> toleranceOverride,
+                std::size_t limit) {
+    const Dataset dataset = Dataset::open(path);
+    const double tolerance = toleranceOverride ? *toleranceOverride : defaultTolerance(dataset.extent());
+
+    jobs::ThreadPool pool;
+    const std::vector<render::LayerCache> layerCaches =
+        render::buildLayerCachesParallel(pool, dataset.layers());
+
+    const std::vector<query::Hit> hits = query::identify(dataset, layerCaches, at, tolerance);
+
+    std::cout << std::format("identify at ({}, {})  tolerance: {}  hits: {}\n", at.x, at.y, tolerance,
+                              hits.size());
+
+    std::size_t shown = 0;
+    for (const query::Hit& hit : hits) {
+        if (shown >= limit) {
+            std::cout << std::format("  ... and {} more (raise --limit to see them)\n", hits.size() - shown);
+            break;
+        }
+        const Layer& layer = dataset.layers()[hit.layerIndex];
+        const Feature& feature = layer.features()[hit.featureIndex];
+        std::cout << std::format("  {} feature {}  distance: {}\n", layer.name(), feature.id(), hit.distance);
+        for (std::size_t i = 0; i < layer.fields().size() && i < feature.attributes().size(); ++i) {
+            std::cout << std::format("    {}: {}\n", layer.fields()[i].name,
+                                      formatAttribute(feature.attributes()[i]));
+        }
+        ++shown;
     }
     return 0;
 }
@@ -213,10 +265,11 @@ void printUsage(const char* argv0) {
     std::cerr << std::format(
         "usage: {} info <path>\n"
         "       {} dump <path> [--limit N]\n"
+        "       {} identify <path> --at x,y [--tolerance N] [--limit N]\n"
         "       {} render <path> [--bbox minX,minY,maxX,maxY] [--size WxH] [--style s.json] -o <output.png>\n"
         "       {} view <path> [--style s.json]\n"
         "       {} bench <path> [--frames N] [--culled] [--style s.json] [-o results.csv]\n",
-        argv0, argv0, argv0, argv0, argv0);
+        argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 }  // namespace
@@ -243,6 +296,26 @@ int main(int argc, char** argv) {
                 }
             }
             return runDump(path, limit);
+        }
+        if (command == "identify") {
+            std::optional<Point2D> at;
+            std::optional<double> tolerance;
+            std::size_t limit = 3;
+            for (int i = 3; i < argc; ++i) {
+                const std::string_view arg = argv[i];
+                if (arg == "--at" && i + 1 < argc) {
+                    at = parsePoint(argv[++i]);
+                } else if (arg == "--tolerance" && i + 1 < argc) {
+                    tolerance = std::stod(argv[++i]);
+                } else if (arg == "--limit" && i + 1 < argc) {
+                    limit = static_cast<std::size_t>(std::strtoul(argv[++i], nullptr, 10));
+                }
+            }
+            if (!at) {
+                std::cerr << "error: --at x,y is required\n";
+                return 1;
+            }
+            return runIdentify(path, *at, tolerance, limit);
         }
         if (command == "render") {
             std::optional<Envelope> bbox;

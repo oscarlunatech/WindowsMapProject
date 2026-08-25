@@ -8,8 +8,11 @@
 #include <cwchar>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <utility>
+#include <variant>
 
+#include "cartograph/query/identify.h"
 #include "cartograph/render/renderer.h"
 
 using cartograph::Dataset;
@@ -41,7 +44,26 @@ std::wstring widen(const std::string& s) {
 
 constexpr double kZoomFactorPerNotch = 1.1;
 constexpr double kPanFraction = 0.1;
+constexpr long kClickSlopPixelsSquared = 4 * 4;  // movement under 4px still counts as a click
+constexpr double kIdentifyRadiusPixels = 5.0;    // click tolerance, converted to map units per-click
+constexpr std::size_t kIdentifyMaxFields = 8;    // fields shown in the overlay for the topmost hit
 constexpr wchar_t kWindowClassName[] = L"CartographViewerWindowClass";
+
+// Returns an empty string for a null attribute, so callers can skip it.
+std::wstring formatAttribute(const cartograph::AttributeValue& value) {
+    return std::visit(
+        [](const auto& v) -> std::wstring {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, std::monostate>) {
+                return {};
+            } else if constexpr (std::is_same_v<T, std::string>) {
+                return widen(v);
+            } else {
+                return std::to_wstring(v);
+            }
+        },
+        value);
+}
 constexpr UINT kMsgDatasetLoaded = WM_APP + 1;
 
 // Posted from loaderThread_ to the UI thread via PostMessageW/kMsgDatasetLoaded
@@ -166,13 +188,19 @@ LRESULT Viewer::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
         case WM_LBUTTONDOWN:
             dragging_ = true;
+            dragMoved_ = false;
             lastMousePos_ = POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             SetCapture(hwnd);
             return 0;
-        case WM_LBUTTONUP:
+        case WM_LBUTTONUP: {
+            const bool wasClick = dragging_ && !dragMoved_;
             dragging_ = false;
             ReleaseCapture();
+            if (wasClick) {
+                onClick(POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
+            }
             return 0;
+        }
         case WM_MOUSEMOVE:
             onMouseMove(POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
             return 0;
@@ -285,6 +313,14 @@ void Viewer::onPaint(HWND hwnd) {
             D2D1::RectF(8.0f, 8.0f, static_cast<float>(screenSize_.width) - 8.0f, 32.0f);
         renderTarget_->DrawText(overlay, static_cast<UINT32>(wcslen(overlay)), textFormat_.Get(), layoutRect,
                                  overlayBrush_.Get());
+
+        if (!identifyText_.empty()) {
+            const D2D1_RECT_F identifyRect = D2D1::RectF(8.0f, 34.0f,
+                                                          static_cast<float>(screenSize_.width) - 8.0f,
+                                                          static_cast<float>(screenSize_.height) - 8.0f);
+            renderTarget_->DrawText(identifyText_.c_str(), static_cast<UINT32>(identifyText_.size()),
+                                     textFormat_.Get(), identifyRect, overlayBrush_.Get());
+        }
     }
 
     const HRESULT hr = renderTarget_->EndDraw();
@@ -302,6 +338,18 @@ void Viewer::onMouseMove(POINT clientPos) {
         return;
     }
 
+    // A press-and-release that never travels more than a few pixels is a
+    // click (identify), not a pan - without this, every click would also
+    // nudge the map by a pixel or two of hand-shake.
+    const long dxPixels = clientPos.x - lastMousePos_.x;
+    const long dyPixels = clientPos.y - lastMousePos_.y;
+    if (dxPixels * dxPixels + dyPixels * dyPixels > kClickSlopPixelsSquared) {
+        dragMoved_ = true;
+    }
+    if (!dragMoved_) {
+        return;  // hold position until it's clearly a drag
+    }
+
     const Viewport viewport = currentViewport();
     const Point2D lastMap = viewport.screenToMap(
         Point2D{static_cast<double>(lastMousePos_.x), static_cast<double>(lastMousePos_.y)});
@@ -316,6 +364,53 @@ void Viewer::onMouseMove(POINT clientPos) {
     mapExtent_.maxY += dy;
 
     lastMousePos_ = clientPos;
+}
+
+void Viewer::onClick(POINT clientPos) {
+    if (loadState_ != LoadState::Ready) {
+        return;
+    }
+
+    const Viewport viewport = currentViewport();
+    const Point2D mapPoint =
+        viewport.screenToMap(Point2D{static_cast<double>(clientPos.x), static_cast<double>(clientPos.y)});
+
+    // A fixed pixel radius is the right unit for a click target, so convert it
+    // to map units against the current zoom rather than picking a map-unit
+    // tolerance that would be enormous zoomed out and useless zoomed in.
+    const double tolerance =
+        viewport.scale() > 0.0 ? kIdentifyRadiusPixels / viewport.scale() : 0.0;
+
+    const std::vector<cartograph::query::Hit> hits =
+        cartograph::query::identify(*dataset_, layerCaches_, mapPoint, tolerance);
+
+    if (hits.empty()) {
+        identifyText_ = L"identify: nothing here";
+        return;
+    }
+
+    const cartograph::query::Hit& hit = hits.front();
+    const Layer& layer = dataset_->layers()[hit.layerIndex];
+    const cartograph::Feature& feature = layer.features()[hit.featureIndex];
+
+    std::wstring text = widen(layer.name()) + L"  feature " + std::to_wstring(feature.id());
+    if (hits.size() > 1) {
+        text += L"   (+" + std::to_wstring(hits.size() - 1) + L" more here)";
+    }
+
+    std::size_t shown = 0;
+    for (std::size_t i = 0; i < layer.fields().size() && i < feature.attributes().size(); ++i) {
+        if (shown >= kIdentifyMaxFields) {
+            break;
+        }
+        const std::wstring value = formatAttribute(feature.attributes()[i]);
+        if (value.empty()) {
+            continue;  // skip nulls; overlay space is scarce
+        }
+        text += L"\n" + widen(layer.fields()[i].name) + L": " + value;
+        ++shown;
+    }
+    identifyText_ = std::move(text);
 }
 
 void Viewer::onMouseWheel(short wheelDelta, POINT clientPos) {

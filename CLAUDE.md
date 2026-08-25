@@ -10,7 +10,7 @@ Cartograph: a fast, correct desktop GIS for Windows (C++ core, eventual WPF shel
 
 ## Current state and the plan to 1.0
 
-**Done: phases 1–7. Next: Phase 8 (identify).**
+**Done: phases 1–8. Next: Phase 9 (multi-layer map model).**
 
 Work happens in ordered phases, and **skipping ahead defeats the point** — each phase is buildable, tested and green before the next starts. If a phase looks like it needs something from a later one, that's a signal to re-scope with the user, not to quietly pull the later work forward.
 
@@ -27,8 +27,8 @@ Work happens in ordered phases, and **skipping ahead defeats the point** — eac
 | **5** | Threading — `jobs::ThreadPool`, background load, parallel per-layer draw prep | done |
 | **6** | Reprojection — `crs::Transformer` over PROJ, every layer normalized to EPSG:4326 | done |
 | **7** | Symbology — single/categorized/graduated renderers, JSON style files | done |
-| **8** | **Identify** — point hit-testing with tolerance, feature → attributes. Reuse `LayerCache`'s R-tree for the candidate set | next |
-| **9** | Multi-layer map model — open N files, ordered layers, visibility/opacity. Retires "one `Dataset` per run"; `drawDataset*` becomes `drawMap` | |
+| **8** | Identify — `geom::predicates` + `query::identify`, `identify` CLI subcommand, click-to-identify in the viewer | done |
+| **9** | **Multi-layer map model** — open N files, ordered layers, visibility/opacity. Retires "one `Dataset` per run"; `drawDataset*` becomes `drawMap` | next |
 | **10** | Display CRS — user-selectable, on-the-fly reprojection, Web Mercator default. Revisits Phase 6 (see constraints below) | |
 | **11** | Raster — GDAL raster read, georeferenced display, band selection + stretch. First non-vector data path in the codebase | |
 | **12** | `Cartograph.Interop` — C++/CLI marshalling boundary, no logic | |
@@ -84,13 +84,13 @@ cmake --build --preset x64-debug
 ctest --preset x64-debug          # or run the test exe directly, see below
 ```
 
-Single test / filtered run (Catch2 tags, e.g. `[render]`, `[dataset]`, `[geometry]`, `[viewport]`, `[index]`, `[simplify]`, `[layer_cache]`, `[style]`):
+Single test / filtered run (Catch2 tags, e.g. `[render]`, `[dataset]`, `[geometry]`, `[viewport]`, `[index]`, `[simplify]`, `[layer_cache]`, `[style]`, `[predicates]`, `[identify]`):
 ```
 build\x64-debug\Cartograph.Core\tests\cartograph_core_tests.exe [render]
 build\x64-debug\Cartograph.Core\tests\cartograph_core_tests.exe "Envelope expands to cover points"
 ```
 
-Run the CLI: `build\x64-debug\cartograph_cli.exe {info|dump|render|view|bench} <path> ...` — see README's Usage section for flags.
+Run the CLI: `build\x64-debug\cartograph_cli.exe {info|dump|identify|render|view|bench} <path> ...` — see README's Usage section for flags.
 
 **Benchmark (and, for real perf-sensitive interactive use, run `view`) via the `x64-release` preset**, not `x64-debug`: `cmake --preset x64-release && cmake --build --preset x64-release`, binaries land in `build\x64-release\`. Since Phase 5 (threading), Debug numbers no longer reflect real per-frame cost — a naive thread pool's per-task synchronization overhead (heap-allocated tasks, mutex/condvar) is disproportionate to the work in an unoptimized (`/Od`, `/RTC1`, debug CRT) build; see the Phase 5 `DECISIONS.md`/`BENCHMARKS.md` entries. `x64-debug` remains correct for day-to-day development and is what the test suite above should keep running against.
 
@@ -110,6 +110,8 @@ Run the CLI: `build\x64-debug\cartograph_cli.exe {info|dump|render|view|bench} <
 7. `crs::Transformer` (`Cartograph.Core/include/cartograph/crs/transformer.h`, added Phase 6) wraps PROJ's C API directly (hidden behind a pimpl, same pattern as `index::SpatialIndex` hiding boost) to reproject points between CRSs — "never write your own datum math," per the Phase 3 `DECISIONS.md` entry. `Dataset::open()` builds one per layer (see item 1); `isIdentity()` short-circuits to a passthrough when source and target are equivalent CRSs, which is what keeps already-`EPSG:4326` data (e.g. the golden-image fixture) bit-for-bit unchanged. See the Phase 6 `DECISIONS.md` entry for three traps hit while wiring this in: feed PROJ WKT2 (not GDAL's default WKT1 pretty-print, which can be ESRI-flavored and PROJ's own parser can reject), always call `proj_normalize_for_visualization` (fixes a silent axis-order swap for CRSs whose authority-defined order isn't conventional GIS lon/lat), and a missing NADCON/NTv2 datum-shift grid (this vcpkg PROJ install ships none) degrades a transform to identity for that step rather than failing loudly — accepted for the specific CRS pairs this project's own datasets use, revisit if that changes.
 
 8. `style::Stylesheet` (`Cartograph.Core/include/cartograph/style/`, added Phase 7) is the symbology system. Three headers: `symbol.h` (`Color`/`Symbol` value types — one `Symbol` carries polygon fill+outline, line stroke and point fill/radius together, because the pre-Phase-7 hardcoded styling used different colors per geometry class and the renderer batches those separately anyway), `style_spec.h` (the dataset-independent `StyleSpec` parsed from a JSON style file, holding one `LayerStyle` = `variant<SingleSymbol, Categorized, Graduated>` per layer name, plus `StyleError`), and `stylesheet.h` (a `StyleSpec` bound to a concrete `Dataset`). **`Symbol`'s default member initializers are exactly the values `renderer.cpp` used to hardcode**, which is what makes `Stylesheet::defaults()` — and therefore the golden-image test — byte-exact; don't change them without re-baselining. `Stylesheet`'s constructor resolves *every feature's* symbol up front into a flat `[layer][feature] -> symbol index` table and dedupes symbols by value, so per-frame symbology costs one array index (same "precompute once, look up every frame" bargain as `LayerCache`, and deliberately a separate object from it so restyling doesn't invalidate the R-tree). That's why `drawDatasetCulled` takes it as a required parameter — build it once when the dataset loads, like the `LayerCache`s. `drawDataset`/`Renderer::render` are the one-shot paths and have defaulting overloads. JSON parsing lives in `src/style/style_io.cpp` with `nlohmann-json` linked `PRIVATE`; unknown layer/field/symbol keys throw rather than falling back silently. See README's Styling section for the file format and the Phase 7 `DECISIONS.md` entry for the rationale.
+
+9. `geom::predicates` + `query::identify` (added Phase 8) are the hit-testing path. `geom::distanceTo(geometry, point)` (`geom/predicates.h`) is the single primitive: distance in map units, exactly `0` when the point is inside a polygon (holes respected), infinity for empty/Unknown geometry so it can never register a hit. Hand-rolled ray-casting and point-to-segment math rather than GEOS or Boost.Geometry — same reasoning as the `geom::simplify` DECISIONS entry (easy to verify against hand-computed cases, unlike datum math), and it avoids both pulling GEOS forward from Phase 19 and converting every candidate `Geometry` into a foreign type per click. `query::identify(...)` (`query/identify.h`) narrows candidates with each `LayerCache`'s R-tree, then runs the exact `distanceTo` test on every candidate — **an overlapping bounding box means very little** (Norway's extent covers a lot of sea), so the index narrows but never decides. Results are ordered topmost-layer-first then nearest-first, matching what's visibly under the cursor. It deliberately tests the *original* geometry, not `LayerCache`'s zoom-simplified copy, so identify answers about the real data rather than about the current zoom's rounding.
 
 **Error handling convention**: exceptions at system boundaries (file I/O, COM/D2D/WIC failures, CLI argument parsing), not error codes — `DatasetOpenError`, `RenderError` and `StyleError` all derive from `std::runtime_error`; `main()` catches `const std::exception&` once at the top rather than per exception type.
 
