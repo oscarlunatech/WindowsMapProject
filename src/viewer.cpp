@@ -52,6 +52,7 @@ constexpr UINT kMsgDatasetLoaded = WM_APP + 1;
 struct LoadResult {
     std::optional<Dataset> dataset;
     std::vector<LayerCache> layerCaches;
+    std::optional<cartograph::style::Stylesheet> stylesheet;
     Envelope extent;
     std::size_t featureCount = 0;
     std::wstring errorMessage;  // engaged only when dataset is nullopt
@@ -59,7 +60,8 @@ struct LoadResult {
 
 }  // namespace
 
-Viewer::Viewer(std::string path) : datasetPath_(std::move(path)) {
+Viewer::Viewer(std::string path, std::string stylePath)
+    : datasetPath_(std::move(path)), stylePath_(std::move(stylePath)) {
     loadMessage_ = L"Loading " + widen(datasetPath_) + L"...";
 }
 
@@ -115,8 +117,18 @@ void Viewer::loadInBackground(HWND hwnd) {
         // on pool_ - dataset must not move until that call returns.
         std::vector<LayerCache> caches = cartograph::render::buildLayerCachesParallel(pool_, dataset.layers());
 
+        // Resolving every feature's symbol is O(features), so it belongs here
+        // on the loader thread with the rest of the load - not in onPaint. A
+        // bad style file surfaces through the same error overlay as a bad
+        // dataset path.
+        cartograph::style::Stylesheet stylesheet =
+            stylePath_.empty()
+                ? cartograph::style::Stylesheet::defaults(dataset)
+                : cartograph::style::Stylesheet(cartograph::style::loadStyleSpec(stylePath_), dataset);
+
         result->dataset = std::move(dataset);
         result->layerCaches = std::move(caches);
+        result->stylesheet = std::move(stylesheet);
         result->extent = extent;
         result->featureCount = featureCount;
     } catch (const std::exception& e) {
@@ -179,6 +191,7 @@ LRESULT Viewer::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (result->dataset) {
                 dataset_ = std::move(result->dataset);
                 layerCaches_ = std::move(result->layerCaches);
+                stylesheet_ = std::move(result->stylesheet);
                 totalFeatureCount_ = result->featureCount;
                 mapExtent_ = result->extent;
                 loadState_ = LoadState::Ready;
@@ -257,8 +270,9 @@ void Viewer::onPaint(HWND hwnd) {
         QueryPerformanceFrequency(&freq);
         QueryPerformanceCounter(&start);
 
-        const std::size_t drawnCount = cartograph::render::drawDatasetCulled(
-            *renderTarget_.Get(), *d2dFactory_.Get(), *dataset_, layerCaches_, currentViewport(), pool_);
+        const std::size_t drawnCount =
+            cartograph::render::drawDatasetCulled(*renderTarget_.Get(), *d2dFactory_.Get(), *dataset_,
+                                                   layerCaches_, currentViewport(), pool_, *stylesheet_);
 
         QueryPerformanceCounter(&end);
         const double ms =

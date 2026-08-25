@@ -15,6 +15,7 @@
 #include "cartograph/jobs/thread_pool.h"
 #include "cartograph/render/layer_cache.h"
 #include "cartograph/render/viewport.h"
+#include "cartograph/style/stylesheet.h"
 
 // Opens a live Win32 window rendering a Dataset with mouse pan, scroll-wheel
 // zoom, keyboard nav, and a frame-timing overlay. Deliberately outside
@@ -30,7 +31,11 @@
 // inside drawDatasetCulled.
 class Viewer {
 public:
-    explicit Viewer(std::string path);
+    // stylePath is a JSON style file (see cartograph/style/style_spec.h), or
+    // empty for the built-in default symbology. It's read and bound to the
+    // dataset on loaderThread_ along with everything else, since
+    // style::Stylesheet's constructor is O(features).
+    explicit Viewer(std::string path, std::string stylePath = {});
     ~Viewer();
 
     Viewer(const Viewer&) = delete;
@@ -56,6 +61,7 @@ private:
     cartograph::render::Viewport currentViewport() const;
 
     std::string datasetPath_;
+    std::string stylePath_;  // empty means default symbology
     cartograph::jobs::ThreadPool pool_;
     std::thread loaderThread_;
     LoadState loadState_ = LoadState::Loading;
@@ -64,6 +70,7 @@ private:
     std::optional<cartograph::Dataset> dataset_;  // engaged once loadState_ == Ready
     std::size_t totalFeatureCount_ = 0;
     std::vector<cartograph::render::LayerCache> layerCaches_;  // one per dataset_->layers(), built once
+    std::optional<cartograph::style::Stylesheet> stylesheet_;  // engaged alongside dataset_, built once
     cartograph::Envelope mapExtent_;
     cartograph::render::ScreenSize screenSize_{1024, 768};
 

@@ -1,0 +1,19 @@
+{
+  "layers": {
+    "ne_110m_admin_0_countries": {
+      "type": "categorized",
+      "field": "CONTINENT",
+      "categories": [
+        { "value": "Africa",                 "symbol": { "fill": "#e8c39e", "outline": "#8a6d4f", "outlineWidth": 0.5 } },
+        { "value": "Asia",                   "symbol": { "fill": "#d9a5a5", "outline": "#8a5252", "outlineWidth": 0.5 } },
+        { "value": "Europe",                 "symbol": { "fill": "#a5b8d9", "outline": "#52678a", "outlineWidth": 0.5 } },
+        { "value": "North America",          "symbol": { "fill": "#a8d3b0", "outline": "#4f7d59", "outlineWidth": 0.5 } },
+        { "value": "South America",          "symbol": { "fill": "#d9cfa5", "outline": "#8a8052", "outlineWidth": 0.5 } },
+        { "value": "Oceania",                "symbol": { "fill": "#c3a5d9", "outline": "#6b528a", "outlineWidth": 0.5 } },
+        { "value": "Antarctica",             "symbol": { "fill": "#eef2f5", "outline": "#9aa8b3", "outlineWidth": 0.5 } },
+        { "value": "Seven seas (open ocean)", "symbol": { "fill": "#cfe3f2", "outline": "#7fa6c4", "outlineWidth": 0.5 } }
+      ],
+      "fallback": { "fill": "#dddddd", "outline": "#999999", "outlineWidth": 0.5 }
+    }
+  }
+}

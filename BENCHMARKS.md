@@ -59,3 +59,26 @@ Live-window CPU profiling of the row above (Task Manager per-core view, `x64-deb
 | Phase 5 (+ parallel geometry build), `x64-debug` | 673.68 | 15.86 | 1106.33 |
 
 Release improved further (~12% faster than the math-only version, ~36% faster than the pre-Phase-5 baseline overall) but not dramatically - D2D's `MULTI_THREADED` factory mode makes concurrent resource creation *safe*, not necessarily highly parallel; it's documented to add its own internal locking around D2D calls, which caps how much real concurrency the sink-writing gets even across multiple worker threads. Debug saw no meaningful change (still ~4x worse than pre-Phase-5) - synchronization overhead dominates either way in an unoptimized build regardless of which phase it's applied to. The `x64-release`-only takeaway above still stands.
+
+## Phase 7 — cost of per-symbol batching (2026-08-24)
+
+Symbology changes `drawDatasetCulled`'s batching from one `ID2D1PathGeometry` per layer to one per (layer, symbol) — a whole layer can no longer share a draw call once its features are allowed to differ in color. That's a direct edit to Phase 4's central optimization, so it needed measuring rather than assuming.
+
+Same hardware, same dataset, same camera path, `x64-release`, three runs each:
+
+| | ms/frame (avg) | ms/frame (min) | ms/frame (max) |
+|---|---|---|---|
+| Phase 5 baseline (no symbology) | 103.90 | 7.34 | 192.69 |
+| Phase 7, default styling (1 symbol) | 107.89 / 104.93 / 102.12 | 8.28–9.08 | 165.17–175.56 |
+| Phase 7, categorized, 7 symbols, **uniform** width 1.5 | 97.07 / 98.96 / 97.89 | 7.56–8.21 | 153.79–197.41 |
+| Phase 7, categorized, 7 symbols, realistic varied widths | 100.34 / 100.05 / 99.54 | 7.83–10.19 | 163.35–171.18 |
+
+Style used for the categorized rows: `MTFCC` (TIGER feature class) into six road classes plus a fallback, applied to all 21 layers at once via the style file's `default` key.
+
+**Single-symbol is unchanged** (~105ms avg vs 103.90ms) — within run-to-run noise, which is what the design intends: one symbol means one bucket, and the batching is bit-identical to Phase 4's.
+
+**Seven symbols is not slower — it's slightly faster** (~98ms). Going from ~21 batched geometries per frame to ~147 is still a trivial number of draw calls, and several smaller `ID2D1PathGeometry` objects appear to be cheaper for D2D to build and traverse than one enormous one, which more than pays for the extra submissions.
+
+**The confounded first measurement, kept because the mistake is instructive:** the realistic road style (bottom row) came out at ~100ms, and reading that as "categorization is free" would have been wrong for the wrong reason. That style uses thinner strokes than the 1.5 default for most road classes, so it hands the rasterizer less coverage to fill — it was partly measuring stroke width, not batching. The uniform-width row exists to isolate the actual variable; it's the one the conclusion above rests on.
+
+No Debug numbers this time: per the Phase 5 takeaway they wouldn't mean anything, and nothing in this phase changes the threading structure.

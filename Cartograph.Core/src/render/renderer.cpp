@@ -146,7 +146,7 @@ ComPtr<ID2D1PathGeometry> buildPathGeometryFromRings(ID2D1Factory& factory, cons
     return path;
 }
 
-// Everything drawDatasetCulled needs from one layer. lineGeometry/
+// One symbol's worth of already-batched drawing work. lineGeometry/
 // polygonGeometry are fully-built ID2D1PathGeometry resources - safe to
 // build on a pool worker (not just the coordinate math) because the factory
 // is created D2D1_FACTORY_TYPE_MULTI_THREADED, which allows concurrent
@@ -155,23 +155,42 @@ ComPtr<ID2D1PathGeometry> buildPathGeometryFromRings(ID2D1Factory& factory, cons
 // ID2D1RenderTarget itself stays thread-affine regardless of factory type,
 // which is why the actual DrawGeometry/FillGeometry/FillEllipse calls in
 // drawDatasetCulled below stay on the caller's thread.
-struct PreparedLayer {
-    ComPtr<ID2D1PathGeometry> lineGeometry;     // null if the layer has no visible lines
-    ComPtr<ID2D1PathGeometry> polygonGeometry;  // null if the layer has no visible polygons
+struct PreparedBatch {
+    std::size_t symbolIndex = 0;
+    ComPtr<ID2D1PathGeometry> lineGeometry;     // null if this batch has no visible lines
+    ComPtr<ID2D1PathGeometry> polygonGeometry;  // null if this batch has no visible polygons
     std::vector<D2D1_POINT_2F> points;
+};
+
+struct PreparedLayer {
+    std::vector<PreparedBatch> batches;  // ascending by symbolIndex, empty groups dropped
     std::size_t visibleCount = 0;
 };
 
 PreparedLayer prepareLayer(ID2D1Factory& factory, const LayerCache& cache, const Viewport& viewport,
-                            double mapUnitsPerPixel, const Envelope& viewExtent) {
+                            double mapUnitsPerPixel, const Envelope& viewExtent,
+                            const style::Stylesheet& stylesheet, std::size_t layerIndex) {
     PreparedLayer prepared;
     const std::vector<std::size_t> visible = cache.query(viewExtent);
     prepared.visibleCount = visible.size();
+    if (visible.empty()) {
+        return prepared;
+    }
 
-    std::vector<const Geometry*> lineGeoms;
-    std::vector<const Geometry*> polygonGeoms;
+    // Bucket this layer's visible features by the symbol they resolve to, so
+    // each distinct symbol still ends up as one batched geometry per geometry
+    // class. Indexed by symbol rather than keyed in a map: symbol tables are
+    // tiny (Stylesheet dedupes by value), so a flat vector walked in index
+    // order is both cheaper and deterministic in draw order.
+    struct Group {
+        std::vector<const Geometry*> lines;
+        std::vector<const Geometry*> polygons;
+        std::vector<D2D1_POINT_2F> points;
+    };
+    std::vector<Group> groups(stylesheet.symbolCount());
 
     for (std::size_t featureIdx : visible) {
+        Group& group = groups[stylesheet.symbolIndex(layerIndex, featureIdx)];
         const Geometry& geometry = cache.simplifiedGeometry(featureIdx, mapUnitsPerPixel);
         switch (geometry.type()) {
             case GeometryType::Point:
@@ -179,68 +198,104 @@ PreparedLayer prepareLayer(ID2D1Factory& factory, const LayerCache& cache, const
                 for (const Part& part : geometry.parts()) {
                     for (const Ring& ring : part) {
                         for (const Point2D& p : ring) {
-                            prepared.points.push_back(toD2DPoint(viewport.mapToScreen(p)));
+                            group.points.push_back(toD2DPoint(viewport.mapToScreen(p)));
                         }
                     }
                 }
                 break;
             case GeometryType::LineString:
             case GeometryType::MultiLineString:
-                lineGeoms.push_back(&geometry);
+                group.lines.push_back(&geometry);
                 break;
             case GeometryType::Polygon:
             case GeometryType::MultiPolygon:
-                polygonGeoms.push_back(&geometry);
+                group.polygons.push_back(&geometry);
                 break;
             case GeometryType::Unknown:
                 break;
         }
     }
 
-    if (!lineGeoms.empty()) {
-        const std::vector<ScreenRing> lineRings = transformGeometryRings(viewport, lineGeoms);
-        prepared.lineGeometry = buildPathGeometryFromRings(factory, lineRings, /*filled=*/false);
-    }
-    if (!polygonGeoms.empty()) {
-        const std::vector<ScreenRing> polygonRings = transformGeometryRings(viewport, polygonGeoms);
-        prepared.polygonGeometry = buildPathGeometryFromRings(factory, polygonRings, /*filled=*/true);
+    for (std::size_t symbolIdx = 0; symbolIdx < groups.size(); ++symbolIdx) {
+        Group& group = groups[symbolIdx];
+        if (group.lines.empty() && group.polygons.empty() && group.points.empty()) {
+            continue;
+        }
+
+        PreparedBatch batch;
+        batch.symbolIndex = symbolIdx;
+        batch.points = std::move(group.points);
+        if (!group.lines.empty()) {
+            const std::vector<ScreenRing> lineRings = transformGeometryRings(viewport, group.lines);
+            batch.lineGeometry = buildPathGeometryFromRings(factory, lineRings, /*filled=*/false);
+        }
+        if (!group.polygons.empty()) {
+            const std::vector<ScreenRing> polygonRings = transformGeometryRings(viewport, group.polygons);
+            batch.polygonGeometry = buildPathGeometryFromRings(factory, polygonRings, /*filled=*/true);
+        }
+        prepared.batches.push_back(std::move(batch));
     }
     return prepared;
 }
 
-struct Brushes {
-    ComPtr<ID2D1SolidColorBrush> polygonFill;
+// The four brushes one style::Symbol needs. Brushes are render-target
+// resources, so unlike the geometry above these can only be created on the
+// caller's thread - done once per frame for the whole (deduplicated, hence
+// small) symbol table rather than per batch, so a categorized layer doesn't
+// re-create the same brush once per category per frame.
+struct SymbolBrushes {
+    ComPtr<ID2D1SolidColorBrush> fill;
     ComPtr<ID2D1SolidColorBrush> polygonStroke;
     ComPtr<ID2D1SolidColorBrush> lineStroke;
     ComPtr<ID2D1SolidColorBrush> pointFill;
 };
 
-// Hardcoded placeholder styling; Phase 7 replaces this with real symbology.
-Brushes createBrushes(ID2D1RenderTarget& target) {
-    Brushes brushes;
-    throwIfFailed(target.CreateSolidColorBrush(D2D1::ColorF(0.85f, 0.85f, 0.85f), &brushes.polygonFill),
-                  "CreateSolidColorBrush(polygonFill)");
-    throwIfFailed(target.CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Black), &brushes.polygonStroke),
-                  "CreateSolidColorBrush(polygonStroke)");
-    throwIfFailed(target.CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.2f, 0.8f), &brushes.lineStroke),
-                  "CreateSolidColorBrush(lineStroke)");
-    throwIfFailed(target.CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Red), &brushes.pointFill),
-                  "CreateSolidColorBrush(pointFill)");
+D2D1_COLOR_F toD2DColor(const style::Color& color) {
+    return D2D1::ColorF(color.r, color.g, color.b, color.a);
+}
+
+std::vector<SymbolBrushes> createSymbolBrushes(ID2D1RenderTarget& target, const style::Stylesheet& stylesheet) {
+    std::vector<SymbolBrushes> brushes;
+    brushes.reserve(stylesheet.symbolCount());
+    for (const style::Symbol& symbol : stylesheet.symbols()) {
+        SymbolBrushes symbolBrushes;
+        throwIfFailed(target.CreateSolidColorBrush(toD2DColor(symbol.fill), &symbolBrushes.fill),
+                      "CreateSolidColorBrush(fill)");
+        throwIfFailed(
+            target.CreateSolidColorBrush(toD2DColor(symbol.polygonStroke), &symbolBrushes.polygonStroke),
+            "CreateSolidColorBrush(polygonStroke)");
+        throwIfFailed(target.CreateSolidColorBrush(toD2DColor(symbol.lineStroke), &symbolBrushes.lineStroke),
+                      "CreateSolidColorBrush(lineStroke)");
+        throwIfFailed(target.CreateSolidColorBrush(toD2DColor(symbol.pointFill), &symbolBrushes.pointFill),
+                      "CreateSolidColorBrush(pointFill)");
+        brushes.push_back(std::move(symbolBrushes));
+    }
     return brushes;
 }
 
-void drawGeometry(ID2D1Factory& factory, ID2D1RenderTarget& target, const Viewport& viewport,
-                   const Brushes& brushes, GeometryType type, const Geometry& geometry) {
-    static constexpr float kPointRadius = 3.0f;
+// A stylesheet built against a different dataset would index out of bounds in
+// the hot loop; catch the mix-up at the call boundary instead.
+void requireStylesheetMatches(const Dataset& dataset, const style::Stylesheet& stylesheet) {
+    if (stylesheet.layerCount() != dataset.layers().size()) {
+        throw RenderError("stylesheet was built against a different dataset (" +
+                          std::to_string(stylesheet.layerCount()) + " layers vs " +
+                          std::to_string(dataset.layers().size()) + ")");
+    }
+}
 
-    switch (type) {
+void drawGeometry(ID2D1Factory& factory, ID2D1RenderTarget& target, const Viewport& viewport,
+                   const style::Symbol& symbol, const SymbolBrushes& brushes, const Geometry& geometry) {
+    switch (geometry.type()) {
         case GeometryType::Point:
         case GeometryType::MultiPoint: {
+            if (symbol.pointRadius <= 0.0f) {
+                break;
+            }
             for (const Part& part : geometry.parts()) {
                 for (const Ring& ring : part) {
                     for (const Point2D& p : ring) {
                         const D2D1_POINT_2F center = toD2DPoint(viewport.mapToScreen(p));
-                        target.FillEllipse(D2D1::Ellipse(center, kPointRadius, kPointRadius),
+                        target.FillEllipse(D2D1::Ellipse(center, symbol.pointRadius, symbol.pointRadius),
                                             brushes.pointFill.Get());
                     }
                 }
@@ -249,15 +304,20 @@ void drawGeometry(ID2D1Factory& factory, ID2D1RenderTarget& target, const Viewpo
         }
         case GeometryType::LineString:
         case GeometryType::MultiLineString: {
+            if (symbol.lineStrokeWidth <= 0.0f) {
+                break;
+            }
             const auto path = buildPathGeometry(factory, viewport, geometry, /*filled=*/false);
-            target.DrawGeometry(path.Get(), brushes.lineStroke.Get(), 1.5f);
+            target.DrawGeometry(path.Get(), brushes.lineStroke.Get(), symbol.lineStrokeWidth);
             break;
         }
         case GeometryType::Polygon:
         case GeometryType::MultiPolygon: {
             const auto path = buildPathGeometry(factory, viewport, geometry, /*filled=*/true);
-            target.FillGeometry(path.Get(), brushes.polygonFill.Get());
-            target.DrawGeometry(path.Get(), brushes.polygonStroke.Get(), 1.0f);
+            target.FillGeometry(path.Get(), brushes.fill.Get());
+            if (symbol.polygonStrokeWidth > 0.0f) {
+                target.DrawGeometry(path.Get(), brushes.polygonStroke.Get(), symbol.polygonStrokeWidth);
+            }
             break;
         }
         case GeometryType::Unknown:
@@ -268,22 +328,33 @@ void drawGeometry(ID2D1Factory& factory, ID2D1RenderTarget& target, const Viewpo
 }  // namespace
 
 void drawDataset(ID2D1RenderTarget& target, ID2D1Factory& factory, const Dataset& dataset,
-                  const Viewport& viewport) {
-    const Brushes brushes = createBrushes(target);
-    for (const Layer& layer : dataset.layers()) {
-        for (const Feature& feature : layer.features()) {
-            drawGeometry(factory, target, viewport, brushes, feature.geometry().type(), feature.geometry());
+                  const Viewport& viewport, const style::Stylesheet& stylesheet) {
+    requireStylesheetMatches(dataset, stylesheet);
+    const std::vector<SymbolBrushes> brushes = createSymbolBrushes(target, stylesheet);
+
+    const std::vector<Layer>& layers = dataset.layers();
+    for (std::size_t layerIdx = 0; layerIdx < layers.size(); ++layerIdx) {
+        const std::vector<Feature>& features = layers[layerIdx].features();
+        for (std::size_t featureIdx = 0; featureIdx < features.size(); ++featureIdx) {
+            const std::size_t symbolIdx = stylesheet.symbolIndex(layerIdx, featureIdx);
+            drawGeometry(factory, target, viewport, stylesheet.symbol(symbolIdx), brushes[symbolIdx],
+                          features[featureIdx].geometry());
         }
     }
 }
 
+void drawDataset(ID2D1RenderTarget& target, ID2D1Factory& factory, const Dataset& dataset,
+                  const Viewport& viewport) {
+    drawDataset(target, factory, dataset, viewport, style::Stylesheet::defaults(dataset));
+}
+
 std::size_t drawDatasetCulled(ID2D1RenderTarget& target, ID2D1Factory& factory, const Dataset& dataset,
                                const std::vector<LayerCache>& layerCaches, const Viewport& viewport,
-                               jobs::ThreadPool& pool) {
-    const Brushes brushes = createBrushes(target);
+                               jobs::ThreadPool& pool, const style::Stylesheet& stylesheet) {
+    requireStylesheetMatches(dataset, stylesheet);
+    const std::vector<SymbolBrushes> brushes = createSymbolBrushes(target, stylesheet);
     const double mapUnitsPerPixel = viewport.scale() > 0.0 ? 1.0 / viewport.scale() : 0.0;
     const Envelope viewExtent = viewport.mapExtent();
-    static constexpr float kPointRadius = 3.0f;
 
     // Parenthesized (std::min) - see the comment on ThreadPool's constructor
     // in thread_pool.h for why, in a TU that also includes windows.h.
@@ -309,10 +380,10 @@ std::size_t drawDatasetCulled(ID2D1RenderTarget& target, ID2D1Factory& factory, 
         const std::size_t begin = layerCount * chunk / chunkCount;
         const std::size_t end = layerCount * (chunk + 1) / chunkCount;
         futures.push_back(pool.submit([&factory, &layerCaches, &viewport, mapUnitsPerPixel, viewExtent, &prepared,
-                                        begin, end] {
+                                        &stylesheet, begin, end] {
             for (std::size_t layerIdx = begin; layerIdx < end; ++layerIdx) {
-                prepared[layerIdx] =
-                    prepareLayer(factory, layerCaches[layerIdx], viewport, mapUnitsPerPixel, viewExtent);
+                prepared[layerIdx] = prepareLayer(factory, layerCaches[layerIdx], viewport, mapUnitsPerPixel,
+                                                   viewExtent, stylesheet, layerIdx);
             }
         }));
     }
@@ -329,15 +400,27 @@ std::size_t drawDatasetCulled(ID2D1RenderTarget& target, ID2D1Factory& factory, 
     for (const PreparedLayer& layer : prepared) {
         drawnCount += layer.visibleCount;
 
-        for (const D2D1_POINT_2F& center : layer.points) {
-            target.FillEllipse(D2D1::Ellipse(center, kPointRadius, kPointRadius), brushes.pointFill.Get());
-        }
-        if (layer.lineGeometry) {
-            target.DrawGeometry(layer.lineGeometry.Get(), brushes.lineStroke.Get(), 1.5f);
-        }
-        if (layer.polygonGeometry) {
-            target.FillGeometry(layer.polygonGeometry.Get(), brushes.polygonFill.Get());
-            target.DrawGeometry(layer.polygonGeometry.Get(), brushes.polygonStroke.Get(), 1.0f);
+        for (const PreparedBatch& batch : layer.batches) {
+            const style::Symbol& symbol = stylesheet.symbol(batch.symbolIndex);
+            const SymbolBrushes& symbolBrushes = brushes[batch.symbolIndex];
+
+            if (symbol.pointRadius > 0.0f) {
+                for (const D2D1_POINT_2F& center : batch.points) {
+                    target.FillEllipse(D2D1::Ellipse(center, symbol.pointRadius, symbol.pointRadius),
+                                        symbolBrushes.pointFill.Get());
+                }
+            }
+            if (batch.lineGeometry && symbol.lineStrokeWidth > 0.0f) {
+                target.DrawGeometry(batch.lineGeometry.Get(), symbolBrushes.lineStroke.Get(),
+                                     symbol.lineStrokeWidth);
+            }
+            if (batch.polygonGeometry) {
+                target.FillGeometry(batch.polygonGeometry.Get(), symbolBrushes.fill.Get());
+                if (symbol.polygonStrokeWidth > 0.0f) {
+                    target.DrawGeometry(batch.polygonGeometry.Get(), symbolBrushes.polygonStroke.Get(),
+                                         symbol.polygonStrokeWidth);
+                }
+            }
         }
     }
 
@@ -374,12 +457,17 @@ void OffscreenTarget::endFrame() {
     throwIfFailed(renderTarget_->EndDraw(), "ID2D1RenderTarget::EndDraw");
 }
 
-ComPtr<IWICBitmap> Renderer::render(const Dataset& dataset, const Viewport& viewport) {
+ComPtr<IWICBitmap> Renderer::render(const Dataset& dataset, const Viewport& viewport,
+                                     const style::Stylesheet& stylesheet) {
     OffscreenTarget target(viewport.screenSize());
     target.beginFrame();
-    drawDataset(target.renderTarget(), target.factory(), dataset, viewport);
+    drawDataset(target.renderTarget(), target.factory(), dataset, viewport, stylesheet);
     target.endFrame();
     return target.bitmap();
+}
+
+ComPtr<IWICBitmap> Renderer::render(const Dataset& dataset, const Viewport& viewport) {
+    return render(dataset, viewport, style::Stylesheet::defaults(dataset));
 }
 
 void savePng(IWICBitmap* bitmap, const std::string& path) {

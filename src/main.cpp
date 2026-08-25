@@ -17,6 +17,7 @@
 #include "cartograph/dataset.h"
 #include "cartograph/jobs/thread_pool.h"
 #include "cartograph/render/renderer.h"
+#include "cartograph/style/stylesheet.h"
 #include "viewer.h"
 
 using namespace cartograph;
@@ -99,12 +100,21 @@ render::ScreenSize parseSize(const std::string& text) {
     return render::ScreenSize{std::stoi(text.substr(0, xPos)), std::stoi(text.substr(xPos + 1))};
 }
 
+// Builds the stylesheet a draw command should use: the --style file if one was
+// given, otherwise style::Symbol's built-in defaults.
+style::Stylesheet buildStylesheet(const Dataset& dataset, const std::string& stylePath) {
+    if (stylePath.empty()) {
+        return style::Stylesheet::defaults(dataset);
+    }
+    return style::Stylesheet(style::loadStyleSpec(stylePath), dataset);
+}
+
 int runRender(const std::string& path, const std::optional<Envelope>& bboxOverride,
-              render::ScreenSize size, const std::string& outputPath) {
+              render::ScreenSize size, const std::string& outputPath, const std::string& stylePath) {
     const Dataset dataset = Dataset::open(path);
     const Envelope bbox = bboxOverride ? *bboxOverride : dataset.extent();
     const render::Viewport viewport(bbox, size);
-    const auto bitmap = render::Renderer::render(dataset, viewport);
+    const auto bitmap = render::Renderer::render(dataset, viewport, buildStylesheet(dataset, stylePath));
     render::savePng(bitmap.Get(), outputPath);
     return 0;
 }
@@ -133,9 +143,15 @@ std::vector<Envelope> buildCameraPath(const Envelope& fullExtent, int frameCount
     return path;
 }
 
-int runBench(const std::string& path, int frameCount, bool culled, const std::string& csvPath) {
+int runBench(const std::string& path, int frameCount, bool culled, const std::string& csvPath,
+             const std::string& stylePath) {
     const Dataset dataset = Dataset::open(path);
     const std::vector<Envelope> cameraPath = buildCameraPath(dataset.extent(), frameCount);
+
+    // Built once, outside the timed loop, for the same reason the LayerCaches
+    // below are: style::Stylesheet resolves every feature's symbol up front so
+    // the per-frame path only does an array lookup.
+    const style::Stylesheet stylesheet = buildStylesheet(dataset, stylePath);
 
     // Building the LayerCache (R-tree + precomputed simplification buckets)
     // happens once, outside the timed loop, same as a live Viewer would do
@@ -167,9 +183,9 @@ int runBench(const std::string& path, int frameCount, bool culled, const std::st
         target.beginFrame();
         if (culled) {
             render::drawDatasetCulled(target.renderTarget(), target.factory(), dataset, layerCaches, viewport,
-                                       pool);
+                                       pool, stylesheet);
         } else {
-            render::drawDataset(target.renderTarget(), target.factory(), dataset, viewport);
+            render::drawDataset(target.renderTarget(), target.factory(), dataset, viewport, stylesheet);
         }
         target.endFrame();
         const auto end = std::chrono::high_resolution_clock::now();
@@ -187,8 +203,8 @@ int runBench(const std::string& path, int frameCount, bool culled, const std::st
     return 0;
 }
 
-int runView(const std::string& path) {
-    Viewer viewer(path);
+int runView(const std::string& path, const std::string& stylePath) {
+    Viewer viewer(path, stylePath);
     viewer.run();
     return 0;
 }
@@ -197,9 +213,9 @@ void printUsage(const char* argv0) {
     std::cerr << std::format(
         "usage: {} info <path>\n"
         "       {} dump <path> [--limit N]\n"
-        "       {} render <path> [--bbox minX,minY,maxX,maxY] [--size WxH] -o <output.png>\n"
-        "       {} view <path>\n"
-        "       {} bench <path> [--frames N] [--culled] [-o results.csv]\n",
+        "       {} render <path> [--bbox minX,minY,maxX,maxY] [--size WxH] [--style s.json] -o <output.png>\n"
+        "       {} view <path> [--style s.json]\n"
+        "       {} bench <path> [--frames N] [--culled] [--style s.json] [-o results.csv]\n",
         argv0, argv0, argv0, argv0, argv0);
 }
 
@@ -232,12 +248,15 @@ int main(int argc, char** argv) {
             std::optional<Envelope> bbox;
             render::ScreenSize size{1024, 768};
             std::string output;
+            std::string style;
             for (int i = 3; i < argc; ++i) {
                 const std::string_view arg = argv[i];
                 if (arg == "--bbox" && i + 1 < argc) {
                     bbox = parseBBox(argv[++i]);
                 } else if (arg == "--size" && i + 1 < argc) {
                     size = parseSize(argv[++i]);
+                } else if (arg == "--style" && i + 1 < argc) {
+                    style = argv[++i];
                 } else if (arg == "-o" && i + 1 < argc) {
                     output = argv[++i];
                 }
@@ -246,26 +265,36 @@ int main(int argc, char** argv) {
                 std::cerr << "error: -o <output.png> is required\n";
                 return 1;
             }
-            return runRender(path, bbox, size, output);
+            return runRender(path, bbox, size, output, style);
         }
         if (command == "view") {
-            return runView(path);
+            std::string style;
+            for (int i = 3; i < argc; ++i) {
+                const std::string_view arg = argv[i];
+                if (arg == "--style" && i + 1 < argc) {
+                    style = argv[++i];
+                }
+            }
+            return runView(path, style);
         }
         if (command == "bench") {
             int frames = 60;
             bool culled = false;
             std::string output = "bench_results.csv";
+            std::string style;
             for (int i = 3; i < argc; ++i) {
                 const std::string_view arg = argv[i];
                 if (arg == "--frames" && i + 1 < argc) {
                     frames = std::atoi(argv[++i]);
                 } else if (arg == "--culled") {
                     culled = true;
+                } else if (arg == "--style" && i + 1 < argc) {
+                    style = argv[++i];
                 } else if (arg == "-o" && i + 1 < argc) {
                     output = argv[++i];
                 }
             }
-            return runBench(path, frames, culled, output);
+            return runBench(path, frames, culled, output, style);
         }
     } catch (const std::exception& e) {
         std::cerr << std::format("error: {}\n", e.what());
