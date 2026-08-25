@@ -4,7 +4,65 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Cartograph: a narrow, fast, correct desktop GIS viewer for Windows (C++ core, eventual WPF shell). Full design rationale, phase-by-phase plan, and explicit non-goals live in [README.md](README.md); real-time decision log in [DECISIONS.md](DECISIONS.md); perf numbers in [BENCHMARKS.md](BENCHMARKS.md). Read all three before making architectural choices — this project is being built in ordered phases (see README's Phases section) and skipping ahead defeats the point.
+Cartograph: a fast, correct desktop GIS for Windows (C++ core, eventual WPF shell).
+
+**This file is the plan of record.** The phase plan below is authoritative — [README.md](README.md) summarizes it for human readers and holds the user-facing material (design goals, build, CLI usage, style-file format); it does not restate the per-phase detail. [DECISIONS.md](DECISIONS.md) is the real-time log of *why* choices were made, [BENCHMARKS.md](BENCHMARKS.md) the perf numbers with dates and hardware. Read DECISIONS before making an architectural choice — most surprising things in this codebase are surprising on purpose and the reason is written down.
+
+## Current state and the plan to 1.0
+
+**Done: phases 1–7. Next: Phase 8 (identify).**
+
+Work happens in ordered phases, and **skipping ahead defeats the point** — each phase is buildable, tested and green before the next starts. If a phase looks like it needs something from a later one, that's a signal to re-scope with the user, not to quietly pull the later work forward.
+
+**Scope changed after Phase 7** (2026-08-24): the target is now a complete GIS at 1.0, not the read-only viewer phases 1–7 were scoped against. Anything written before that date — a code comment, a DECISIONS entry — may describe a narrower project. See the scope-change entry in DECISIONS.md.
+
+### Phases
+
+| | Phase | |
+|---|---|---|
+| **1** | Data model — `Dataset`/`Layer`/`Feature`/`Geometry`, GDAL confined to `dataset.cpp` | done |
+| **2** | Off-screen rendering — Direct2D + WIC to PNG, golden-image test | done |
+| **3** | Live window — Win32 `HWND`, message loop, pan/zoom | done |
+| **4** | Make it fast — R-tree culling, Douglas-Peucker simplification, batched draw calls | done |
+| **5** | Threading — `jobs::ThreadPool`, background load, parallel per-layer draw prep | done |
+| **6** | Reprojection — `crs::Transformer` over PROJ, every layer normalized to EPSG:4326 | done |
+| **7** | Symbology — single/categorized/graduated renderers, JSON style files | done |
+| **8** | **Identify** — point hit-testing with tolerance, feature → attributes. Reuse `LayerCache`'s R-tree for the candidate set | next |
+| **9** | Multi-layer map model — open N files, ordered layers, visibility/opacity. Retires "one `Dataset` per run"; `drawDataset*` becomes `drawMap` | |
+| **10** | Display CRS — user-selectable, on-the-fly reprojection, Web Mercator default. Revisits Phase 6 (see constraints below) | |
+| **11** | Raster — GDAL raster read, georeferenced display, band selection + stretch. First non-vector data path in the codebase | |
+| **12** | `Cartograph.Interop` — C++/CLI marshalling boundary, no logic | |
+| **13** | WPF shell I — window, hosted D2D map surface, layer list, toolbar | |
+| **14** | WPF shell II — identify panel, attribute table, selection, symbology editor | |
+| **15** | Labels — DirectWrite, placement rules, collision avoidance. Deferred out of Phase 7 deliberately | |
+| **16** | Mutable data model — feature mutation + cache invalidation. **Prerequisite for 17** (see constraints) | |
+| **17** | Editing — digitize, move/delete vertices and features, snapping, undo/redo | |
+| **18** | Persistence — write to GeoPackage/Shapefile, project save/load. Ends the read-only era | |
+| **19** | Analysis toolbox — buffer, clip, intersect, dissolve, spatial join, validity. First actual use of GEOS, a dependency since Phase 1 | |
+| **20** | Basemaps — XYZ/slippy tiles, async fetch, disk cache. Needs Phase 10's Web Mercator | |
+| **21** | Export — print layout, PNG/PDF at arbitrary scale. Reuse `drawDatasetCulled`, don't grow `Renderer::render` a mode flag | |
+
+### Two constraints that will bite if forgotten
+
+1. **Phase 16 must precede Phase 17.** `style::Stylesheet` precomputes every feature's symbol at construction, and `LayerCache` precomputes an R-tree plus simplification buckets — both justified explicitly by features being immutable after `Dataset::open()` returns. Editing kills that justification. Phase 16 exists so the reckoning is a deliberate phase with its own tests, not something discovered midway through building digitizing tools.
+2. **Phase 10 reopens Phase 6's central decision.** Phase 6 normalizes every layer to `EPSG:4326` at load, chosen partly because the golden-image fixture is already in it (keeping that test byte-exact). A selectable display CRS makes 4326 one option among many. Keeping it explicitly available is what should preserve the golden-image test — verify that at the *start* of Phase 10, not the end.
+
+### How thin each new pillar's 1.0 slice is
+
+All four pillars are in, but each is scoped to a genuine-but-minimal slice so "fully functional" stays checkable. Don't widen these without re-scoping with the user first.
+
+| Pillar | In 1.0 | Not in 1.0 |
+|---|---|---|
+| Raster | Display, georeferencing, band selection, contrast stretch | Band math, reclassify, raster analysis, terrain derivatives |
+| Editing | Geometry + attribute editing, snapping, undo/redo, save | Topology editing, multi-user locking, versioning |
+| Analysis | Core GEOS overlay/proximity ops, one at a time | Graphical modeler, batch processing, network analysis |
+| Web | XYZ/slippy tile basemaps | WMS, WFS, WMTS, authenticated services |
+
+Permanently out of scope regardless: cross-platform, 3D scenes/terrain, network analysis, mobile/web clients, plugin or scripting host.
+
+### When a phase completes
+
+Update this file (move the phase to `done`, advance the "Next:" line above), add a DECISIONS.md entry for any real fork in the road, add BENCHMARKS.md numbers if the phase touched performance, and update README's status line. There is **no CI** — the Phase 1 DECISIONS entry anticipated it and it still doesn't exist, so a green local `ctest --preset x64-debug` is currently the only gate.
 
 ## Build environment
 

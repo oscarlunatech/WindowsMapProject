@@ -1,27 +1,28 @@
 # Cartograph
 
-A narrow, fast, correct desktop GIS viewer for Windows. C++ core, WPF shell.
+A fast, correct desktop GIS for Windows. C++ core, WPF shell.
 
-Status: **Phase 7 (symbology) complete.** See [DECISIONS.md](DECISIONS.md) and [BENCHMARKS.md](BENCHMARKS.md) for the running log.
+Status: **Phase 7 (symbology) complete** — 7 of 21 phases to 1.0. See [DECISIONS.md](DECISIONS.md) and [BENCHMARKS.md](BENCHMARKS.md) for the running log.
 
 ## Design goals
 
 1. **Correct before fast.** A wrong map drawn at 120fps is worthless. Every projection and geometry path gets a test.
 2. **Fast enough to feel native.** Target: pan and zoom a 500k-feature layer at 60fps on a mid-range laptop.
 3. **The core knows nothing about the UI.** No Windows types, no WPF, no rendering API leak into the data and geometry layers.
-4. **Narrow scope, no clone.** This is a viewer with identify and basic symbology. Not an editor, not a geoprocessing suite.
+4. **Complete, not comprehensive.** 1.0 covers a whole GIS workflow — open, project, style, label, identify, edit, analyze, export — with each capability actually finished. It does not try to match QGIS feature-for-feature. Depth where it counts, an honest "no" everywhere else.
+5. **Every phase ships.** The build is green and the tests pass at the end of every phase. No long-lived broken branches, no phase that only makes sense once the next one lands.
 
 ## Architecture
 
 Native core, managed shell, explicit boundary between them.
 
 ```
-Cartograph.Shell    (C#, WPF, MVVM)          — layer list, toolbar, identify panel
+Cartograph.Shell    (C#, WPF, MVVM)          — layer list, toolbar, identify panel, attribute table
 Cartograph.Interop  (C++/CLI)                — thin marshalling layer, no logic
-Cartograph.Core     (C++20, static lib)      — data/, geom/, crs/, index/, render/, jobs/
+Cartograph.Core     (C++20, static lib)      — data/, geom/, crs/, index/, render/, jobs/, style/
 ```
 
-Anything in `Cartograph.Core` must compile and be testable without a window existing.
+Anything in `Cartograph.Core` must compile and be testable without a window existing. Phases 1–7 were built and tested with no shell in existence at all, and phases 8–11 continue that way on purpose: the hard problems stay in testable Core, so the shell arrives as a view onto a model that already behaves.
 
 ## Building
 
@@ -101,21 +102,19 @@ cartograph_cli render Cartograph.Core/tests/fixtures/ne_110m_admin_0_countries.s
     --style styles/countries-by-continent.json -o continents.png
 ```
 
-## Phases
+## Roadmap
 
-Built in order; each phase is buildable and tested before the next starts.
+Built in ordered phases; each is buildable and tested before the next starts. **7 of 21 phases done.** The authoritative per-phase plan — scope, ordering constraints, and how thin each pillar's 1.0 slice is — lives in [CLAUDE.md](CLAUDE.md), so it stays in one place rather than drifting between two.
 
-| Phase | | Status |
+| Phases | | |
 |---|---|---|
-| 1 | Data model — `Dataset`/`Layer`/`Feature`/`Geometry`, GDAL confined to `dataset.cpp` | done |
-| 2 | Off-screen rendering — Direct2D + WIC to PNG, golden-image test | done |
-| 3 | Live window — Win32 `HWND`, message loop, pan/zoom | done |
-| 4 | Make it fast — R-tree culling, Douglas-Peucker simplification, batched draw calls | done |
-| 5 | Threading — `jobs::ThreadPool`, background load, parallel per-layer draw prep | done |
-| 6 | Reprojection — `crs::Transformer` over PROJ, every layer normalized to EPSG:4326 | done |
-| 7 | Symbology — single/categorized/graduated renderers, JSON style files | done |
-| 8 | Identify — click a feature, show its attributes | next |
-| 9 | WPF shell — `Cartograph.Interop` (C++/CLI), layer list, toolbar, identify panel | |
+| 1–7 | **Foundations** — data model, rendering, live window, performance, threading, reprojection, symbology | done |
+| 8–11 | **A real map model** — identify, multi-layer, selectable display CRS, raster display | next |
+| 12–14 | **The shell** — C++/CLI interop, then WPF: map surface, layer list, identify panel, attribute table | |
+| 15–18 | **Cartography and editing** — labels, a mutable data model, digitizing, persistence | |
+| 19–21 | **Analysis and output** — GEOS toolbox, XYZ basemaps, print/export | |
+
+The shell deliberately lands at 12, not 8: the model still has to grow multi-layer support, a selectable display CRS and a non-vector data path, and building a UI against a single-dataset, single-CRS, vector-only model means reworking it underneath itself three times. Phases 1–7 showed hard problems are cheap to get right in a Core with no window.
 
 ## Test data
 
@@ -128,7 +127,19 @@ Fixture data is small enough to commit and is what the golden-image test compare
 
 ## Explicitly out of scope
 
-- Geoprocessing toolbox, network analysis, 3D scenes
-- Web services (WMS/WFS), tile servers, ArcGIS Online anything
-- Cross-platform support — this is a Windows project on purpose
-- Format writing — read-only until the editing stretch goal, if ever
+Permanently:
+
+- **Cross-platform support** — this is a Windows project on purpose, and the Direct2D/WPF choices are load-bearing, not incidental
+- **3D scenes and terrain** — a different renderer and a different problem
+- **Network analysis** (routing, service areas, isochrones)
+- **Mobile or web clients**, ArcGIS Online / Enterprise integration
+- **Plugin or scripting host** — no embedded Python, no extension API
+
+Deferred past 1.0 rather than rejected — [CLAUDE.md](CLAUDE.md)'s pillar table has the full in/out breakdown:
+
+- WMS/WFS/WMTS and authenticated remote services (XYZ tiles *are* in, at Phase 20)
+- Raster analysis: band math, reclassification, terrain derivatives
+- Graphical model builder and batch geoprocessing
+- Topology editing, versioning, multi-user editing
+
+The 1.0 target is a GIS that does a complete workflow well, not one that does everything shallowly. Anything above that turns out to matter more than something inside the plan gets argued out in [DECISIONS.md](DECISIONS.md) first, not smuggled into a phase.
