@@ -70,3 +70,47 @@ TEST_CASE("NAD83 to WGS84 (the real NJ roads case) degrades gracefully without a
     REQUIRE(result.x == original.x);
     REQUIRE(result.y == original.y);
 }
+
+TEST_CASE("Web Mercator clamps to its declared area of use", "[crs]") {
+    // PROJ itself does not clamp: without this, latitude -90 transforms to
+    // y = -242,529,000, twelve times EPSG:3857's own southern bound, and
+    // finite - so nothing errors, the data just becomes unusable and any
+    // dataset containing Antarctica blows the map extent up by 12x.
+    const Transformer t("EPSG:4326", "EPSG:3857");
+    REQUIRE_FALSE(t.isIdentity());
+
+    const Envelope& bounds = t.targetBounds();
+    REQUIRE(bounds.valid);
+
+    // The canonical Web Mercator bound is 20,037,508 m, at latitude
+    // 85.0511288 (the latitude that makes the world exactly square). PROJ
+    // reports the *EPSG registry's* area of use instead, which is rounded to
+    // 85.06 - and near the pole a degree of latitude is ~1,276 km of
+    // northing, so that 0.0089-degree rounding is ~11 km, putting the bound
+    // at ~20,048,966. Deliberately not corrected to the canonical constant:
+    // the clamp's job is to stop PROJ extrapolating to 242,000,000, and
+    // 0.06% past the square is irrelevant to that. Asserted loosely so this
+    // doesn't break if a PROJ update refines the registry value.
+    REQUIRE(bounds.maxY == Catch::Approx(20037508.0).margin(20000.0));
+    REQUIRE(bounds.minY == Catch::Approx(-20037508.0).margin(20000.0));
+
+    const Point2D pole = t.transform(Point2D{10.0, -90.0});
+    REQUIRE(pole.y == Catch::Approx(bounds.minY));
+
+    // Inside the area of use the clamp must not touch anything.
+    const Point2D mid = t.transform(Point2D{10.0, 45.0});
+    REQUIRE(mid.y == Catch::Approx(5621521.0).margin(100.0));
+}
+
+TEST_CASE("An identity transform clamps nothing", "[crs]") {
+    // Same-CRS transforms short-circuit before any bounds are computed, which
+    // is what keeps already-EPSG:4326 data (the golden-image fixture) exactly
+    // untouched.
+    const Transformer t("EPSG:4326", "EPSG:4326");
+    REQUIRE(t.isIdentity());
+    REQUIRE_FALSE(t.targetBounds().valid);
+
+    const Point2D pole{10.0, -90.0};
+    REQUIRE(t.transform(pole).x == pole.x);
+    REQUIRE(t.transform(pole).y == pole.y);
+}

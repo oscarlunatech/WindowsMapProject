@@ -33,7 +33,7 @@ public:
     // built-in default symbology; it's read and bound to the map on
     // loaderThread_ along with everything else, since style::Stylesheet's
     // constructor is O(features).
-    explicit Viewer(std::vector<std::string> paths, std::string stylePath = {});
+    explicit Viewer(std::vector<std::string> paths, std::string displayCrs, std::string stylePath = {});
     ~Viewer();
 
     Viewer(const Viewer&) = delete;
@@ -60,6 +60,7 @@ private:
     cartograph::render::Viewport currentViewport() const;
 
     std::vector<std::string> datasetPaths_;
+    std::string displayCrs_;
     std::string stylePath_;  // empty means default symbology
     cartograph::jobs::ThreadPool pool_;
     std::thread loaderThread_;

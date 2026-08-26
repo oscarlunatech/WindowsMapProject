@@ -21,8 +21,12 @@ std::string countriesPath() { return fixturePath("ne_110m_admin_0_countries.shp"
 
 // Opening the fixture and building its cache is the expensive part, so the
 // read-only cases share one map.
+//
+// EPSG:4326 explicitly, not the Phase 10 default of EPSG:3857: every probe
+// point below is a real-world lon/lat, and map coordinates have to be in the
+// same units for those to mean anything.
 const Map& countries() {
-    static const Map map = Map::open(countriesPath());
+    static const Map map = Map::open(countriesPath(), "EPSG:4326");
     return map;
 }
 
@@ -97,7 +101,7 @@ TEST_CASE("identify uses exact geometry, not the feature's bounding box", "[iden
 TEST_CASE("identify reports the topmost layer first", "[identify]") {
     // Same file stacked twice: layer 1 is drawn over layer 0, so a click that
     // hits both must report layer 1 first.
-    const Map stacked = Map::open(std::vector<std::string>{countriesPath(), countriesPath()});
+    const Map stacked = Map::open(std::vector<std::string>{countriesPath(), countriesPath()}, "EPSG:4326");
     REQUIRE(stacked.layers().size() == 2);
 
     const std::vector<Hit> hits = identify(stacked, Point2D{2.3, 46.5}, 0.0);
@@ -109,7 +113,7 @@ TEST_CASE("identify reports the topmost layer first", "[identify]") {
 }
 
 TEST_CASE("identify skips hidden layers", "[identify]") {
-    Map stacked = Map::open(std::vector<std::string>{countriesPath(), countriesPath()});
+    Map stacked = Map::open(std::vector<std::string>{countriesPath(), countriesPath()}, "EPSG:4326");
     const Point2D inFrance{2.3, 46.5};
 
     REQUIRE(identify(stacked, inFrance, 0.0).size() == 2);

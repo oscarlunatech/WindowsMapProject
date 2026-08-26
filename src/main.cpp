@@ -15,6 +15,7 @@
 #include <variant>
 #include <vector>
 
+#include "cartograph/crs/transformer.h"
 #include "cartograph/dataset.h"
 #include "cartograph/jobs/thread_pool.h"
 #include "cartograph/map.h"
@@ -114,9 +115,9 @@ int runDump(const std::vector<std::string>& paths, std::size_t limit) {
 
 // Lists the map's layer stack in draw order, which is what a layer panel will
 // eventually show - bottom layer first, topmost last.
-int runLayers(const std::vector<std::string>& paths) {
+int runLayers(const std::vector<std::string>& paths, const std::string& crs) {
     jobs::ThreadPool pool;
-    const Map map = Map::open(paths, pool);
+    const Map map = Map::open(paths, crs, pool);
 
     std::cout << std::format("{} layer(s), drawn bottom to top:\n", map.layers().size());
     for (std::size_t i = 0; i < map.layers().size(); ++i) {
@@ -145,10 +146,11 @@ double defaultTolerance(const Envelope& extent) {
     return 0.001 * std::hypot(extent.width(), extent.height());
 }
 
-int runIdentify(const std::vector<std::string>& paths, Point2D at, std::optional<double> toleranceOverride,
+int runIdentify(const std::vector<std::string>& paths, const std::string& crs, Point2D at,
+                std::optional<double> toleranceOverride,
                 std::size_t limit) {
     jobs::ThreadPool pool;
-    const Map map = Map::open(paths, pool);
+    const Map map = Map::open(paths, crs, pool);
     const double tolerance = toleranceOverride ? *toleranceOverride : defaultTolerance(map.extent());
 
     const std::vector<query::Hit> hits = query::identify(map, at, tolerance);
@@ -199,10 +201,11 @@ render::ScreenSize parseSize(const std::string& text) {
     return render::ScreenSize{std::stoi(text.substr(0, xPos)), std::stoi(text.substr(xPos + 1))};
 }
 
-int runRender(const std::vector<std::string>& paths, const std::optional<Envelope>& bboxOverride,
+int runRender(const std::vector<std::string>& paths, const std::string& crs,
+              const std::optional<Envelope>& bboxOverride,
               render::ScreenSize size, const std::string& outputPath, const std::string& stylePath) {
     jobs::ThreadPool pool;
-    const Map map = Map::open(paths, pool);
+    const Map map = Map::open(paths, crs, pool);
     const Envelope bbox = bboxOverride ? *bboxOverride : map.extent();
     const render::Viewport viewport(bbox, size);
     const auto bitmap = render::Renderer::render(map, viewport, buildStylesheet(map, stylePath));
@@ -215,10 +218,23 @@ int runRender(const std::vector<std::string>& paths, const std::optional<Envelop
 // giving a fixed, reproducible camera path: frame 0 is the worst case for an
 // unindexed draw (everything visible), the last frame is where culling and
 // simplification should matter least (small, already-dense view).
-std::vector<Envelope> buildCameraPath(const Envelope& fullExtent, int frameCount) {
+//
+// The target is written as lon/lat because that's how anyone reading it can
+// tell where it is, then transformed into whatever CRS the map is actually in
+// - otherwise passing --crs would silently aim the camera at a point in the
+// Atlantic (or, in EPSG:3857 metres, a point 74 metres from the origin).
+std::vector<Envelope> buildCameraPath(const Envelope& fullExtent, int frameCount, const std::string& crs) {
+    const Point2D newarkLonLat{-74.19, 40.74};
+    const crs::Transformer toMapCrs("EPSG:4326", crs);
+
+    // A tenth of a degree around Newark, expressed in the map's own units by
+    // transforming the corners rather than assuming degrees.
+    const Point2D lowerLeft = toMapCrs.transform(Point2D{newarkLonLat.x - 0.05, newarkLonLat.y - 0.05});
+    const Point2D upperRight = toMapCrs.transform(Point2D{newarkLonLat.x + 0.05, newarkLonLat.y + 0.05});
+
     Envelope zoomed;
-    zoomed.expand(Point2D{-74.19 - 0.05, 40.74 - 0.05});
-    zoomed.expand(Point2D{-74.19 + 0.05, 40.74 + 0.05});
+    zoomed.expand(lowerLeft);
+    zoomed.expand(upperRight);
 
     std::vector<Envelope> path;
     path.reserve(static_cast<std::size_t>(frameCount));
@@ -234,7 +250,8 @@ std::vector<Envelope> buildCameraPath(const Envelope& fullExtent, int frameCount
     return path;
 }
 
-int runBench(const std::vector<std::string>& paths, int frameCount, bool culled, const std::string& csvPath,
+int runBench(const std::vector<std::string>& paths, const std::string& crs, int frameCount, bool culled,
+             const std::string& csvPath,
              const std::string& stylePath) {
     // Map::open builds every layer's R-tree and simplification buckets, in
     // parallel across the pool, before the timed loop starts - the benchmark
@@ -242,9 +259,9 @@ int runBench(const std::vector<std::string>& paths, int frameCount, bool culled,
     // stylesheet, which resolves every feature's symbol up front so the
     // per-frame path only does an array lookup.
     jobs::ThreadPool pool;
-    const Map map = Map::open(paths, pool);
+    const Map map = Map::open(paths, crs, pool);
     const style::Stylesheet stylesheet = buildStylesheet(map, stylePath);
-    const std::vector<Envelope> cameraPath = buildCameraPath(map.extent(), frameCount);
+    const std::vector<Envelope> cameraPath = buildCameraPath(map.extent(), frameCount, crs);
 
     const render::ScreenSize size{1024, 768};
     render::OffscreenTarget target(size);
@@ -284,8 +301,8 @@ int runBench(const std::vector<std::string>& paths, int frameCount, bool culled,
     return 0;
 }
 
-int runView(const std::vector<std::string>& paths, const std::string& stylePath) {
-    Viewer viewer(paths, stylePath);
+int runView(const std::vector<std::string>& paths, const std::string& crs, const std::string& stylePath) {
+    Viewer viewer(paths, crs, stylePath);
     viewer.run();
     return 0;
 }
@@ -294,15 +311,18 @@ void printUsage(const char* argv0) {
     std::cerr << std::format(
         "usage: {0} info <path>... \n"
         "       {0} dump <path>... [--limit N]\n"
-        "       {0} layers <path>...\n"
-        "       {0} identify <path>... --at x,y [--tolerance N] [--limit N]\n"
-        "       {0} render <path>... [--bbox minX,minY,maxX,maxY] [--size WxH] [--style s.json] "
-        "-o <output.png>\n"
-        "       {0} view <path>... [--style s.json]\n"
-        "       {0} bench <path>... [--frames N] [--culled] [--style s.json] [-o results.csv]\n"
+        "       {0} layers <path>... [--crs EPSG:NNNN]\n"
+        "       {0} identify <path>... --at x,y [--crs EPSG:NNNN] [--tolerance N] [--limit N]\n"
+        "       {0} render <path>... [--bbox minX,minY,maxX,maxY] [--size WxH] [--crs EPSG:NNNN] "
+        "[--style s.json] -o <output.png>\n"
+        "       {0} view <path>... [--crs EPSG:NNNN] [--style s.json]\n"
+        "       {0} bench <path>... [--frames N] [--culled] [--crs EPSG:NNNN] [--style s.json] "
+        "[-o results.csv]\n"
         "\n"
-        "Multiple paths stack as layers, first path at the bottom.\n",
-        argv0);
+        "Multiple paths stack as layers, first path at the bottom.\n"
+        "--crs sets the display CRS every layer is reprojected into; --bbox and --at are read in\n"
+        "that CRS. Defaults to {1} ({2} for bench, to keep its numbers comparable).\n",
+        argv0, Dataset::defaultDisplayCrs(), "EPSG:4326");
 }
 
 }  // namespace
@@ -321,12 +341,28 @@ int main(int argc, char** argv) {
     }
     const int flagStart = 2 + static_cast<int>(paths.size());
 
+    // --crs applies to every command that builds a Map, so it's parsed once
+    // here rather than repeated in each branch.
+    std::optional<std::string> crsOverride;
+    for (int i = flagStart; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--crs" && i + 1 < argc) {
+            crsOverride = argv[i + 1];
+        }
+    }
+    // bench defaults to EPSG:4326 rather than the usual EPSG:3857, so its
+    // numbers stay comparable with every figure already recorded in
+    // BENCHMARKS.md - reprojecting the dataset would change what's being
+    // measured. Pass --crs explicitly to benchmark a different projection.
+    const std::string crs = crsOverride ? *crsOverride
+                            : command == "bench" ? std::string("EPSG:4326")
+                                                  : std::string(Dataset::defaultDisplayCrs());
+
     try {
         if (command == "info") {
             return runInfo(paths);
         }
         if (command == "layers") {
-            return runLayers(paths);
+            return runLayers(paths, crs);
         }
         if (command == "dump") {
             std::size_t limit = 10;
@@ -356,7 +392,7 @@ int main(int argc, char** argv) {
                 std::cerr << "error: --at x,y is required\n";
                 return 1;
             }
-            return runIdentify(paths, *at, tolerance, limit);
+            return runIdentify(paths, crs, *at, tolerance, limit);
         }
         if (command == "render") {
             std::optional<Envelope> bbox;
@@ -379,7 +415,7 @@ int main(int argc, char** argv) {
                 std::cerr << "error: -o <output.png> is required\n";
                 return 1;
             }
-            return runRender(paths, bbox, size, output, style);
+            return runRender(paths, crs, bbox, size, output, style);
         }
         if (command == "view") {
             std::string style;
@@ -389,7 +425,7 @@ int main(int argc, char** argv) {
                     style = argv[++i];
                 }
             }
-            return runView(paths, style);
+            return runView(paths, crs, style);
         }
         if (command == "bench") {
             int frames = 60;
@@ -408,7 +444,7 @@ int main(int argc, char** argv) {
                     output = argv[++i];
                 }
             }
-            return runBench(paths, frames, culled, output, style);
+            return runBench(paths, crs, frames, culled, output, style);
         }
     } catch (const std::exception& e) {
         std::cerr << std::format("error: {}\n", e.what());

@@ -31,12 +31,29 @@ public:
     Transformer(Transformer&&) noexcept;
     Transformer& operator=(Transformer&&) noexcept;
 
+    // Transforms one point, clamped to the target CRS's valid extent (see
+    // targetBounds below). An identity transform returns its input untouched.
     Point2D transform(Point2D point) const;
 
     // True if source and target are equivalent CRSs (per PROJ's own
     // comparison, not a string match) - transform() is then guaranteed to
     // return its input unchanged rather than merely numerically very close.
     bool isIdentity() const;
+
+    // The target CRS's area of use, projected into target coordinates -
+    // i.e. the box outside which the target CRS has no declared validity.
+    // Invalid (`.valid == false`) when PROJ declares no area of use, or for
+    // an identity transform, in which case transform() clamps nothing.
+    //
+    // This exists because PROJ does not clamp: EPSG:3857 at latitude -90
+    // yields y = -242,529,000, twelve times the projection's own southern
+    // bound of -20,037,508, and finite - so nothing errors, the data merely
+    // becomes unusable. Any dataset reaching the poles (the Natural Earth
+    // countries fixture does, via Antarctica) would blow the map extent up
+    // by 12x and render the world as a sliver. Clamping to the declared area
+    // of use is what makes a Web Mercator display CRS behave the way every
+    // web map does: Antarctica flattens onto the bottom edge.
+    const Envelope& targetBounds() const;
 
 private:
     struct Impl;

@@ -87,8 +87,10 @@ std::wstring describePaths(const std::vector<std::string>& paths) {
 
 }  // namespace
 
-Viewer::Viewer(std::vector<std::string> paths, std::string stylePath)
-    : datasetPaths_(std::move(paths)), stylePath_(std::move(stylePath)) {
+Viewer::Viewer(std::vector<std::string> paths, std::string displayCrs, std::string stylePath)
+    : datasetPaths_(std::move(paths)),
+      displayCrs_(std::move(displayCrs)),
+      stylePath_(std::move(stylePath)) {
     loadMessage_ = L"Loading " + describePaths(datasetPaths_) + L"...";
 }
 
@@ -136,7 +138,7 @@ void Viewer::loadInBackground(HWND hwnd) {
         // simplification buckets, fanned across pool_. Safe to use pool_ from
         // here because loaderThread_ is a dedicated thread, not a pool worker -
         // see the no-nested-submission rule in thread_pool.h.
-        Map map = Map::open(datasetPaths_, pool_);
+        Map map = Map::open(datasetPaths_, displayCrs_, pool_);
         const Envelope extent = map.extent();
         const std::size_t featureCount = map.featureCount();
 

@@ -13,6 +13,7 @@ add_executable(cartograph_core_tests
     test_style.cpp
     test_predicates.cpp
     test_identify.cpp
+    test_map.cpp
 )
 
 target_link_libraries(cartograph_core_tests PRIVATE Cartograph::Core Catch2::Catch2WithMain)

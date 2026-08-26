@@ -85,7 +85,12 @@ std::size_t countPixels(const std::vector<std::uint8_t>& pixels, std::uint8_t b,
 }  // namespace
 
 TEST_CASE("rendering the countries fixture matches the committed golden image", "[render]") {
-    const Map map = Map::open(fixturePath("ne_110m_admin_0_countries.shp"));
+    // EPSG:4326 explicitly, not the default. Since Phase 10 the default
+    // display CRS is EPSG:3857, which would reproject this fixture and
+    // invalidate the golden image. Asking for 4326 keeps the source data's
+    // own CRS, which crs::Transformer short-circuits to an exact identity -
+    // that is what keeps this comparison byte-exact across the phase.
+    const Map map = Map::open(fixturePath("ne_110m_admin_0_countries.shp"), "EPSG:4326");
 
     Envelope bbox;
     bbox.expand(Point2D{-180, -90});
@@ -105,7 +110,10 @@ TEST_CASE("the culled draw path draws each category with its own symbol", "[rend
     // covers drawMapCulled, where symbology has to survive being grouped into
     // one batched ID2D1PathGeometry per symbol - the part of Phase 7 that
     // could plausibly draw a whole layer in one category's color.
-    const Map map = Map::open(fixturePath("ne_110m_admin_0_countries.shp"));
+    //
+    // EPSG:4326 so the bbox below can stay in degrees - this is a symbology
+    // test, not a projection one.
+    const Map map = Map::open(fixturePath("ne_110m_admin_0_countries.shp"), "EPSG:4326");
 
     style::Symbol africa;
     africa.fill = style::Color{1.0f, 0.0f, 0.0f, 1.0f};
@@ -159,8 +167,10 @@ TEST_CASE("a hidden layer draws nothing and an opaque one covers what's below", 
     // "default" style applies to both, which is fine here since what's under
     // test is visibility and opacity, not styling. Outlines are off so
     // interior pixels are exactly the fill color.
+    // EPSG:4326 so the bbox below can stay in degrees - what's under test is
+    // visibility and opacity, not projection.
     const std::string path = fixturePath("ne_110m_admin_0_countries.shp");
-    Map stacked = Map::open(std::vector<std::string>{path, path});
+    Map stacked = Map::open(std::vector<std::string>{path, path}, "EPSG:4326");
     REQUIRE(stacked.layers().size() == 2);
 
     style::Symbol green;

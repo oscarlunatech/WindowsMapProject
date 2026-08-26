@@ -4,12 +4,15 @@
 
 #include <windows.h>
 
+#include <cmath>
+
 namespace cartograph::crs {
 
 struct Transformer::Impl {
     PJ_CONTEXT* ctx = nullptr;
     PJ* transform = nullptr;  // null when identity == true
     bool identity = false;
+    Envelope targetBounds;  // invalid when the target declares no area of use
 
     ~Impl() {
         if (transform != nullptr) {
@@ -52,6 +55,68 @@ const std::string& executableDirectory() {
         return lastSlash == std::string::npos ? path : path.substr(0, lastSlash);
     }();
     return dir;
+}
+
+// The target CRS's area of use is published in degrees (lon/lat); this walks
+// that box's perimeter through a WGS84 -> target transform to get the
+// corresponding extent in target coordinates.
+//
+// The perimeter is sampled rather than just the four corners because a
+// projection's edges bow: for a conic or transverse-Mercator target the
+// extreme easting can fall at the middle of an edge, not at a corner, and
+// four corners alone would clip real data. 32 samples per side is far more
+// than enough at this precision, and it happens once per Transformer.
+Envelope computeTargetBounds(PJ_CONTEXT* ctx, const std::string& targetCrs) {
+    Envelope bounds;
+
+    PJ* target = proj_create(ctx, targetCrs.c_str());
+    if (target == nullptr) {
+        return bounds;
+    }
+    double west = 0.0;
+    double south = 0.0;
+    double east = 0.0;
+    double north = 0.0;
+    const int haveArea =
+        proj_get_area_of_use(ctx, target, &west, &south, &east, &north, nullptr);
+    proj_destroy(target);
+    if (haveArea == 0 || west > east || south > north) {
+        return bounds;  // no declared area of use; nothing to clamp to
+    }
+
+    PJ* raw = proj_create_crs_to_crs(ctx, "EPSG:4326", targetCrs.c_str(), nullptr);
+    if (raw == nullptr) {
+        return bounds;
+    }
+    PJ* toTarget = proj_normalize_for_visualization(ctx, raw);
+    proj_destroy(raw);
+    if (toTarget == nullptr) {
+        return bounds;
+    }
+
+    constexpr int kSamples = 32;
+    const auto sample = [&](double lon, double lat) {
+        const PJ_COORD out = proj_trans(toTarget, PJ_FWD, proj_coord(lon, lat, 0, 0));
+        if (std::isfinite(out.xy.x) && std::isfinite(out.xy.y)) {
+            bounds.expand(Point2D{out.xy.x, out.xy.y});
+        }
+    };
+    for (int i = 0; i <= kSamples; ++i) {
+        const double t = static_cast<double>(i) / kSamples;
+        const double lon = west + (east - west) * t;
+        const double lat = south + (north - south) * t;
+        sample(lon, south);
+        sample(lon, north);
+        sample(west, lat);
+        sample(east, lat);
+    }
+
+    proj_destroy(toTarget);
+    return bounds;
+}
+
+double clampTo(double value, double low, double high) {
+    return value < low ? low : (value > high ? high : value);
 }
 }  // namespace
 
@@ -111,6 +176,7 @@ Transformer::Transformer(const std::string& sourceCrsWkt, const std::string& tar
         throw CrsError("failed to normalize transform axis order: " + lastError(impl_->ctx));
     }
     impl_->transform = normalized;
+    impl_->targetBounds = computeTargetBounds(impl_->ctx, targetCrs);
 }
 
 Transformer::~Transformer() = default;
@@ -123,9 +189,20 @@ Point2D Transformer::transform(Point2D point) const {
     }
     const PJ_COORD input = proj_coord(point.x, point.y, 0, 0);
     const PJ_COORD output = proj_trans(impl_->transform, PJ_FWD, input);
-    return Point2D{output.xy.x, output.xy.y};
+
+    // See targetBounds() in the header for why this clamp exists: PROJ
+    // extrapolates far outside a projection's declared validity and reports
+    // finite values while doing it, so nothing else would catch it.
+    const Envelope& bounds = impl_->targetBounds;
+    if (!bounds.valid) {
+        return Point2D{output.xy.x, output.xy.y};
+    }
+    return Point2D{clampTo(output.xy.x, bounds.minX, bounds.maxX),
+                    clampTo(output.xy.y, bounds.minY, bounds.maxY)};
 }
 
 bool Transformer::isIdentity() const { return impl_->identity; }
+
+const Envelope& Transformer::targetBounds() const { return impl_->targetBounds; }
 
 }  // namespace cartograph::crs

@@ -13,10 +13,14 @@ namespace cartograph {
 
 namespace {
 
-// Every layer is normalized to this CRS at load time (see convertLayer),
-// so layers from different source CRSs render correctly aligned together
+// The display CRS a Dataset is normalized to when the caller doesn't name one.
+// EPSG:3857 (Web Mercator) matches what every web map and basemap uses, which
+// is what Phase 20 (XYZ tiles) will need; EPSG:4326 stays available and is
+// what the golden-image test asks for explicitly.
+// Whatever the target, every layer is normalized to it at load time (see
+// convertLayer), so layers from different source CRSs render correctly aligned
 // instead of each staying in its own native coordinate space.
-constexpr const char* kTargetCrs = "EPSG:4326";
+constexpr const char* kDefaultDisplayCrs = "EPSG:3857";
 
 // proj.db ships next to the running executable (see CMakeLists.txt); PROJ
 // doesn't discover it there on its own. std::call_once (rather than a plain
@@ -174,7 +178,7 @@ Geometry convertGeometry(OGRGeometry* geom, const crs::Transformer* transformer)
     return Geometry{type, std::move(parts)};
 }
 
-Layer convertLayer(OGRLayer& ogrLayer) {
+Layer convertLayer(OGRLayer& ogrLayer, const std::string& targetCrs) {
     std::vector<FieldDef> fields;
     const OGRFeatureDefn* defn = ogrLayer.GetLayerDefn();
     for (int i = 0; i < defn->GetFieldCount(); ++i) {
@@ -199,7 +203,7 @@ Layer convertLayer(OGRLayer& ogrLayer) {
     // transform from.
     std::optional<crs::Transformer> transformer;
     if (!sourceCrsWkt.empty()) {
-        transformer.emplace(sourceCrsWkt, kTargetCrs);
+        transformer.emplace(sourceCrsWkt, targetCrs);
     }
     const crs::Transformer* transformerPtr = transformer ? &*transformer : nullptr;
 
@@ -217,23 +221,23 @@ Layer convertLayer(OGRLayer& ogrLayer) {
 
     // Computed from the (already-reprojected) features rather than
     // ogrLayer.GetExtent()'s native-CRS bbox, which would be wrong once
-    // geometry has moved to kTargetCrs.
+    // geometry has moved to targetCrs.
     Envelope extent;
     for (const Feature& feature : features) {
         extent.expand(feature.geometry().extent());
     }
 
-    // Reports the CRS the coordinates are actually in: kTargetCrs if a
+    // Reports the CRS the coordinates are actually in: targetCrs if a
     // transform was applied, or empty if the layer had no CRS metadata to
-    // begin with (honest "unknown", not a false claim it's in kTargetCrs).
-    const std::string crsWkt = transformerPtr != nullptr ? kTargetCrs : std::string();
+    // begin with (honest "unknown", not a false claim it's in targetCrs).
+    const std::string crsWkt = transformerPtr != nullptr ? targetCrs : std::string();
 
     return Layer{ogrLayer.GetName(), std::move(fields), std::move(features), extent, crsWkt};
 }
 
 }  // namespace
 
-Dataset Dataset::open(const std::string& path) {
+Dataset Dataset::open(const std::string& path, const std::string& targetCrs) {
     ensurePlatformSetup();
 
     auto* gdalDataset =
@@ -243,13 +247,24 @@ Dataset Dataset::open(const std::string& path) {
     }
 
     std::vector<Layer> layers;
-    for (OGRLayer* ogrLayer : gdalDataset->GetLayers()) {
-        layers.push_back(convertLayer(*ogrLayer));
+    try {
+        for (OGRLayer* ogrLayer : gdalDataset->GetLayers()) {
+            layers.push_back(convertLayer(*ogrLayer, targetCrs));
+        }
+    } catch (...) {
+        // A bad --crs surfaces as a CrsError from deep inside convertLayer;
+        // the GDAL handle still has to be closed on the way out.
+        GDALClose(gdalDataset);
+        throw;
     }
 
     GDALClose(gdalDataset);
     return Dataset{std::move(layers)};
 }
+
+Dataset Dataset::open(const std::string& path) { return open(path, kDefaultDisplayCrs); }
+
+const char* Dataset::defaultDisplayCrs() { return kDefaultDisplayCrs; }
 
 Envelope Dataset::extent() const {
     Envelope extent;
