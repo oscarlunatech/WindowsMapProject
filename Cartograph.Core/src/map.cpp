@@ -1,6 +1,7 @@
 #include "cartograph/map.h"
 
 #include <algorithm>
+#include <stdexcept>
 #include <utility>
 
 namespace cartograph {
@@ -18,7 +19,52 @@ void restoreDisplayState(const std::vector<MapLayer>& from, std::vector<MapLayer
     }
 }
 
+// "C:\data\hillshade.tif" -> "hillshade". A raster file is one layer and
+// carries no layer name of its own, so its stem is the closest thing to one.
+std::string stemOf(const std::string& path) {
+    const std::size_t lastSlash = path.find_last_of("\\/");
+    const std::size_t start = lastSlash == std::string::npos ? 0 : lastSlash + 1;
+    const std::size_t lastDot = path.find_last_of('.');
+    const std::size_t end = (lastDot == std::string::npos || lastDot < start) ? path.size() : lastDot;
+    return path.substr(start, end - start);
+}
+
 }  // namespace
+
+MapLayer::MapLayer(Layer layer, render::LayerCache cache, std::string sourcePath)
+    : content_(VectorContent{std::move(layer), std::move(cache)}), sourcePath_(std::move(sourcePath)) {}
+
+MapLayer::MapLayer(std::string name, std::shared_ptr<raster::RasterSource> source, std::string sourcePath)
+    : content_(RasterContent{std::move(name), std::move(source), {}}),
+      sourcePath_(std::move(sourcePath)) {}
+
+const std::string& MapLayer::name() const {
+    if (const auto* raster = std::get_if<RasterContent>(&content_)) {
+        return raster->name;
+    }
+    return std::get<VectorContent>(content_).layer.name();
+}
+
+Envelope MapLayer::extent() const {
+    if (const auto* raster = std::get_if<RasterContent>(&content_)) {
+        return raster->source->extent();
+    }
+    return std::get<VectorContent>(content_).layer.extent();
+}
+
+const Layer& MapLayer::layer() const { return std::get<VectorContent>(content_).layer; }
+
+const render::LayerCache& MapLayer::cache() const { return std::get<VectorContent>(content_).cache; }
+
+const std::shared_ptr<raster::RasterSource>& MapLayer::rasterSource() const {
+    return std::get<RasterContent>(content_).source;
+}
+
+const raster::RasterImage& MapLayer::image() const { return std::get<RasterContent>(content_).image; }
+
+void MapLayer::setImage(raster::RasterImage image) {
+    std::get<RasterContent>(content_).image = std::move(image);
+}
 
 void MapLayer::setOpacity(float opacity) {
     opacity_ = opacity < 0.0f ? 0.0f : (opacity > 1.0f ? 1.0f : opacity);
@@ -48,11 +94,43 @@ void Map::addDataset(Dataset dataset, const std::string& sourcePath, jobs::Threa
     }
 }
 
+void Map::addRaster(std::shared_ptr<raster::RasterSource> source, const std::string& sourcePath) {
+    sourcePaths_.push_back(sourcePath);
+    layers_.emplace_back(stemOf(sourcePath), std::move(source), sourcePath);
+}
+
+namespace {
+
+// Tries a path as vector, then as raster. Callers shouldn't have to declare
+// which a file is - GDAL already knows, and requiring a flag would make
+// `view a.shp b.tif` impossible to express.
+//
+// The vector error is the one reported if both fail: for a path that is
+// neither, "failed to open" from the vector side is the more useful message,
+// and a genuine raster that fails to *warp* throws RasterError out of here
+// rather than being swallowed.
+void addPath(Map& map, const std::string& path, const std::string& displayCrs, jobs::ThreadPool* pool) {
+    try {
+        Dataset dataset = Dataset::open(path, displayCrs);
+        if (pool != nullptr) {
+            map.addDataset(std::move(dataset), path, *pool);
+        } else {
+            map.addDataset(std::move(dataset), path);
+        }
+        return;
+    } catch (const DatasetOpenError&) {
+        // Not openable as vector - fall through and try raster.
+    }
+    map.addRaster(std::make_shared<raster::RasterSource>(path, displayCrs), path);
+}
+
+}  // namespace
+
 Map Map::open(const std::vector<std::string>& paths, const std::string& displayCrs) {
     Map map;
     map.displayCrs_ = displayCrs;
     for (const std::string& path : paths) {
-        map.addDataset(Dataset::open(path, displayCrs), path);
+        addPath(map, path, displayCrs, nullptr);
     }
     return map;
 }
@@ -61,7 +139,7 @@ Map Map::open(const std::vector<std::string>& paths, const std::string& displayC
     Map map;
     map.displayCrs_ = displayCrs;
     for (const std::string& path : paths) {
-        map.addDataset(Dataset::open(path, displayCrs), path, pool);
+        addPath(map, path, displayCrs, &pool);
     }
     return map;
 }
@@ -103,7 +181,7 @@ void Map::setDisplayCrs(const std::string& displayCrs, jobs::ThreadPool& pool) {
 Envelope Map::extent() const {
     Envelope extent;
     for (const MapLayer& mapLayer : layers_) {
-        extent.expand(mapLayer.layer().extent());
+        extent.expand(mapLayer.extent());
     }
     return extent;
 }
@@ -111,7 +189,9 @@ Envelope Map::extent() const {
 std::size_t Map::featureCount() const {
     std::size_t count = 0;
     for (const MapLayer& mapLayer : layers_) {
-        count += mapLayer.layer().features().size();
+        if (!mapLayer.isRaster()) {
+            count += mapLayer.layer().features().size();
+        }
     }
     return count;
 }

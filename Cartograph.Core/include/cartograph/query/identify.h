@@ -10,8 +10,18 @@ namespace cartograph::query {
 
 struct Hit {
     std::size_t layerIndex;  // index into map.layers()
-    std::size_t featureIndex;
-    double distance;  // map units; exactly 0 when the point falls inside a polygon
+
+    // Vector hit: which feature, and how far the point fell from it (exactly 0
+    // when inside a polygon). Meaningless when bandValues is non-empty.
+    std::size_t featureIndex = 0;
+    double distance = 0.0;
+
+    // Raster hit: the raw, unstretched value of every band at that point.
+    // Non-empty exactly when this hit came from a raster layer - a raster has
+    // no features, so there is no featureIndex to report.
+    std::vector<double> bandValues;
+
+    bool isRaster() const { return !bandValues.empty(); }
 };
 
 // Every feature within tolerance (map units) of mapPoint.

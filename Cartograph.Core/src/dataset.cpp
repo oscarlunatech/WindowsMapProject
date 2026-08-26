@@ -8,6 +8,7 @@
 #include <optional>
 
 #include "cartograph/crs/transformer.h"
+#include "gdal_platform.h"
 
 namespace cartograph {
 
@@ -22,22 +23,6 @@ namespace {
 // instead of each staying in its own native coordinate space.
 constexpr const char* kDefaultDisplayCrs = "EPSG:3857";
 
-// proj.db ships next to the running executable (see CMakeLists.txt); PROJ
-// doesn't discover it there on its own. std::call_once (rather than a plain
-// static bool) matters now that Dataset::open can be called from a
-// background loader thread (Phase 5) - a plain bool double-checked-init has
-// no memory barrier and would race if two threads ever called open() at
-// nearly the same time.
-void ensurePlatformSetup() {
-    static std::once_flag initialized;
-    std::call_once(initialized, [] {
-        char exePath[1024];
-        if (CPLGetExecPath(exePath, sizeof(exePath))) {
-            CPLSetConfigOption("PROJ_DATA", CPLGetDirname(exePath));
-        }
-        GDALAllRegister();
-    });
-}
 
 FieldType convertFieldType(OGRFieldType type) {
     switch (type) {
@@ -238,7 +223,7 @@ Layer convertLayer(OGRLayer& ogrLayer, const std::string& targetCrs) {
 }  // namespace
 
 Dataset Dataset::open(const std::string& path, const std::string& targetCrs) {
-    ensurePlatformSetup();
+    detail::ensureGdalPlatformSetup();
 
     auto* gdalDataset =
         static_cast<GDALDataset*>(GDALOpenEx(path.c_str(), GDAL_OF_VECTOR, nullptr, nullptr, nullptr));

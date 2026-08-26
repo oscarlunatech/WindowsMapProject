@@ -21,6 +21,21 @@ std::vector<Hit> identify(const Map& map, Point2D mapPoint, double tolerance) {
         if (!mapLayer.visible()) {
             continue;
         }
+
+        if (mapLayer.isRaster()) {
+            // A raster answers with the pixel under the point, not with a
+            // nearest-feature search - tolerance has no meaning here, since
+            // every point inside the raster is on it.
+            std::vector<double> values = mapLayer.rasterSource()->sample(mapPoint);
+            if (!values.empty()) {
+                Hit hit;
+                hit.layerIndex = layerIndex;
+                hit.bandValues = std::move(values);
+                hits.push_back(std::move(hit));
+            }
+            continue;
+        }
+
         const std::vector<Feature>& features = mapLayer.layer().features();
 
         for (const std::size_t featureIndex : mapLayer.cache().query(probe)) {
@@ -29,7 +44,11 @@ std::vector<Hit> identify(const Map& map, Point2D mapPoint, double tolerance) {
             }
             const double distance = geom::distanceTo(features[featureIndex].geometry(), mapPoint);
             if (distance <= tolerance) {
-                hits.push_back(Hit{layerIndex, featureIndex, distance});
+                Hit hit;
+                hit.layerIndex = layerIndex;
+                hit.featureIndex = featureIndex;
+                hit.distance = distance;
+                hits.push_back(std::move(hit));
             }
         }
     }

@@ -22,6 +22,21 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// Re-reads every visible raster layer's window for this viewport and stores
+// the result on the layer, so a following drawMap/drawMapCulled has current
+// pixels to blit.
+//
+// Synchronous, and does file I/O - the caller chooses the thread. One-shot
+// commands (render, bench) call it inline; the live viewer calls it on a
+// background thread and hands the images back to the UI thread, because a read
+// must never happen in the paint path.
+//
+// Reads at the viewport's own pixel size, so a raster stays sharp at every
+// zoom rather than being scaled up from one load-time bitmap. GDAL selects a
+// matching overview level for the downsampled request by itself, which is what
+// keeps this cheap on pyramided files.
+void refreshRasterLayers(Map& map, const Viewport& viewport, const style::Stylesheet& stylesheet);
+
 // Draws every feature of every visible layer into an already-open render
 // target (the caller owns BeginDraw/EndDraw) using the given viewport. Layers
 // draw bottom-to-top in map.layers() order, so later layers land on top.

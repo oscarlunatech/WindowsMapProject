@@ -291,6 +291,41 @@ void requireStylesheetMatches(const Map& map, const style::Stylesheet& styleshee
 // separately instead - visibly different only where features inside the same
 // layer overlap each other, which for the layer stacks this viewer targets is
 // a good trade. Revisit if a use case needs the exact semantics.
+// Uploads a RasterImage to the render target and draws it into the rectangle
+// its own extent maps to.
+//
+// Placed by the image's extent rather than the viewport's, which is what makes
+// a stale image behave sensibly: after a pan the previous read still lands on
+// the ground it actually covers, merely offset and soft, until a fresher read
+// replaces it - rather than sliding around with the camera.
+void drawRasterImage(ID2D1RenderTarget& target, const raster::RasterImage& image, const Viewport& viewport,
+                      float opacity) {
+    if (image.empty() || !image.extent.valid || opacity <= 0.0f) {
+        return;
+    }
+
+    ComPtr<ID2D1Bitmap> bitmap;
+    const D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    const HRESULT hr = target.CreateBitmap(
+        D2D1::SizeU(static_cast<UINT32>(image.width), static_cast<UINT32>(image.height)), image.bgra.data(),
+        static_cast<UINT32>(image.width) * 4, properties, &bitmap);
+    if (FAILED(hr)) {
+        throw RenderError("CreateBitmap (raster) failed (hr=" + std::to_string(hr) + ")");
+    }
+
+    // Top-left and bottom-right of the image's extent in screen space. mapToScreen
+    // flips Y, so the extent's maxY is the destination rect's top.
+    const Point2D topLeft = viewport.mapToScreen(Point2D{image.extent.minX, image.extent.maxY});
+    const Point2D bottomRight = viewport.mapToScreen(Point2D{image.extent.maxX, image.extent.minY});
+    const D2D1_RECT_F destination =
+        D2D1::RectF(static_cast<float>(topLeft.x), static_cast<float>(topLeft.y),
+                     static_cast<float>(bottomRight.x), static_cast<float>(bottomRight.y));
+
+    target.DrawBitmap(bitmap.Get(), destination, opacity,
+                       D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+}
+
 void setBrushOpacity(const std::vector<SymbolBrushes>& brushes, float opacity) {
     for (const SymbolBrushes& symbolBrushes : brushes) {
         symbolBrushes.fill->SetOpacity(opacity);
@@ -344,6 +379,21 @@ void drawGeometry(ID2D1Factory& factory, ID2D1RenderTarget& target, const Viewpo
 
 }  // namespace
 
+void refreshRasterLayers(Map& map, const Viewport& viewport, const style::Stylesheet& stylesheet) {
+    requireStylesheetMatches(map, stylesheet);
+    const Envelope window = viewport.mapExtent();
+
+    for (std::size_t layerIdx = 0; layerIdx < map.layers().size(); ++layerIdx) {
+        MapLayer& mapLayer = map.layers()[layerIdx];
+        if (!mapLayer.isRaster() || !mapLayer.visible()) {
+            continue;
+        }
+        mapLayer.setImage(mapLayer.rasterSource()->read(window, viewport.screenSize().width,
+                                                         viewport.screenSize().height,
+                                                         stylesheet.rasterStyle(layerIdx)));
+    }
+}
+
 void drawMap(ID2D1RenderTarget& target, ID2D1Factory& factory, const Map& map, const Viewport& viewport,
               const style::Stylesheet& stylesheet) {
     requireStylesheetMatches(map, stylesheet);
@@ -352,6 +402,10 @@ void drawMap(ID2D1RenderTarget& target, ID2D1Factory& factory, const Map& map, c
     for (std::size_t layerIdx = 0; layerIdx < map.layers().size(); ++layerIdx) {
         const MapLayer& mapLayer = map.layers()[layerIdx];
         if (!mapLayer.visible()) {
+            continue;
+        }
+        if (mapLayer.isRaster()) {
+            drawRasterImage(target, mapLayer.image(), viewport, mapLayer.opacity());
             continue;
         }
         setBrushOpacity(brushes, mapLayer.opacity());
@@ -403,8 +457,11 @@ std::size_t drawMapCulled(ID2D1RenderTarget& target, ID2D1Factory& factory, cons
             for (std::size_t layerIdx = begin; layerIdx < end; ++layerIdx) {
                 // Hidden layers cost nothing: no query, no simplification, no
                 // geometry built, and prepared[layerIdx] stays empty so phase
-                // 2 below skips it too.
-                if (!map.layers()[layerIdx].visible()) {
+                // 2 below skips it too. Raster layers prepare nothing here
+                // either - their pixels were read elsewhere (off this thread,
+                // see RasterSource) and phase 2 just blits them.
+                const MapLayer& mapLayer = map.layers()[layerIdx];
+                if (!mapLayer.visible() || mapLayer.isRaster()) {
                     continue;
                 }
                 prepared[layerIdx] = prepareLayer(factory, map.layers()[layerIdx].cache(), viewport,
@@ -423,12 +480,20 @@ std::size_t drawMapCulled(ID2D1RenderTarget& target, ID2D1Factory& factory, cons
     // (BeginFigure/AddLine per point) happened in parallel above.
     std::size_t drawnCount = 0;
     for (std::size_t layerIdx = 0; layerIdx < prepared.size(); ++layerIdx) {
+        const MapLayer& mapLayer = map.layers()[layerIdx];
+        if (mapLayer.isRaster()) {
+            if (mapLayer.visible()) {
+                drawRasterImage(target, mapLayer.image(), viewport, mapLayer.opacity());
+            }
+            continue;
+        }
+
         const PreparedLayer& layer = prepared[layerIdx];
         drawnCount += layer.visibleCount;  // 0 for a hidden layer, which prepares nothing
         if (layer.batches.empty()) {
             continue;
         }
-        setBrushOpacity(brushes, map.layers()[layerIdx].opacity());
+        setBrushOpacity(brushes, mapLayer.opacity());
 
         for (const PreparedBatch& batch : layer.batches) {
             const style::Symbol& symbol = stylesheet.symbol(batch.symbolIndex);

@@ -1,0 +1,11 @@
+{
+  "layers": {
+    "NE1_50M_SR_W": {
+      "type": "raster",
+      "stretch": "none"
+    },
+    "ne_110m_admin_0_countries": {
+      "symbol": { "fill": "#00000000", "outline": "#ffffffcc", "outlineWidth": 1.0 }
+    }
+  }
+}

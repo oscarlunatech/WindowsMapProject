@@ -197,6 +197,60 @@ Graduated parseGraduated(const Json& object, const std::string& context) {
     return graduated;
 }
 
+RasterSymbol parseRaster(const Json& object, const std::string& context) {
+    RasterSymbol symbol;
+
+    if (object.contains("bands")) {
+        if (!object["bands"].is_array()) {
+            fail(std::format("{}: \"bands\" must be an array of 1-based band numbers", context));
+        }
+        for (const Json& band : object["bands"]) {
+            if (!band.is_number_integer() || band.get<int>() < 1) {
+                fail(std::format("{}: band numbers are 1-based integers", context));
+            }
+            symbol.raster.bands.push_back(band.get<int>());
+        }
+        const std::size_t count = symbol.raster.bands.size();
+        if (count != 1 && count != 3) {
+            fail(std::format("{}: \"bands\" must name either 1 band (grayscale) or 3 (red, green, blue)",
+                              context));
+        }
+    }
+
+    if (object.contains("stretch")) {
+        if (!object["stretch"].is_string()) {
+            fail(std::format("{}: \"stretch\" must be \"auto\", \"none\", \"minmax\" or \"percentile\"", context));
+        }
+        const std::string mode = object["stretch"].get<std::string>();
+        if (mode == "auto") {
+            symbol.raster.stretch = raster::StretchMode::Automatic;
+        } else if (mode == "none") {
+            symbol.raster.stretch = raster::StretchMode::None;
+        } else if (mode == "minmax") {
+            symbol.raster.stretch = raster::StretchMode::MinMax;
+        } else if (mode == "percentile") {
+            symbol.raster.stretch = raster::StretchMode::Percentile;
+        } else {
+            fail(std::format("{}: unknown stretch '{}' (expected \"auto\", \"none\", \"minmax\" or \"percentile\")",
+                              context, mode));
+        }
+    }
+
+    if (object.contains("stretchRange")) {
+        const Json& range = object["stretchRange"];
+        if (!range.is_array() || range.size() != 2 || !range[0].is_number() || !range[1].is_number()) {
+            fail(std::format("{}: \"stretchRange\" must be two percentages, e.g. [2, 98]", context));
+        }
+        symbol.raster.stretchLow = range[0].get<double>();
+        symbol.raster.stretchHigh = range[1].get<double>();
+        if (!(symbol.raster.stretchHigh > symbol.raster.stretchLow)) {
+            fail(std::format("{}: \"stretchRange\" must be ascending", context));
+        }
+    }
+
+    return symbol;
+}
+
 LayerStyle parseLayerStyle(const Json& object, const std::string& context) {
     if (!object.is_object()) {
         fail(std::format("{}: a layer style must be a JSON object", context));
@@ -214,8 +268,12 @@ LayerStyle parseLayerStyle(const Json& object, const std::string& context) {
     if (type == "graduated") {
         return parseGraduated(object, context);
     }
-    fail(std::format("{}: unknown style type '{}' (expected \"single\", \"categorized\" or \"graduated\")",
-                      context, type));
+    if (type == "raster") {
+        return parseRaster(object, context);
+    }
+    fail(std::format(
+        "{}: unknown style type '{}' (expected \"single\", \"categorized\", \"graduated\" or \"raster\")",
+        context, type));
 }
 
 }  // namespace

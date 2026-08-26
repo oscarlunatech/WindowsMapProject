@@ -57,6 +57,16 @@ private:
     void zoomAt(cartograph::Point2D anchorMap, double factor);
     void loadInBackground(HWND hwnd);  // runs on loaderThread_
 
+    // Raster layers are re-read at screen resolution whenever the view moves
+    // far enough to matter, so they stay sharp at every zoom. The read is file
+    // I/O and must never happen in onPaint, so it runs on rasterThread_ and
+    // the finished images come back through the message queue - the same
+    // handoff loadInBackground uses.
+    void maybeStartRasterRead(HWND hwnd);
+    void readRastersInBackground(HWND hwnd, cartograph::Envelope window,
+                                  cartograph::render::ScreenSize size);
+    bool rasterReadWorthwhile(const cartograph::Envelope& current) const;
+
     cartograph::render::Viewport currentViewport() const;
 
     std::vector<std::string> datasetPaths_;
@@ -84,4 +94,9 @@ private:
     POINT lastMousePos_{};
 
     std::wstring identifyText_;  // overlay text from the last click; empty until one happens
+
+    std::thread rasterThread_;             // joined before the next read starts, and in the destructor
+    bool rasterReadInFlight_ = false;      // UI thread only
+    bool anyRasterLayers_ = false;         // set when the map loads; skips all of this when false
+    cartograph::Envelope rasterReadExtent_;  // the view the in-flight or latest read covers
 };

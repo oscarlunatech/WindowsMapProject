@@ -28,7 +28,7 @@ std::string joinLayerNames(const Map& map) {
         if (!joined.empty()) {
             joined += ", ";
         }
-        joined += mapLayer.layer().name();
+        joined += mapLayer.name();
     }
     return joined.empty() ? "(none)" : joined;
 }
@@ -164,7 +164,12 @@ std::vector<std::uint32_t> resolveLayer(std::vector<Symbol>& symbols, const Laye
     if (const auto* categorized = std::get_if<Categorized>(&style)) {
         return resolveCategorized(symbols, layer, *categorized);
     }
-    return resolveGraduated(symbols, layer, std::get<Graduated>(style));
+    if (const auto* graduated = std::get_if<Graduated>(&style)) {
+        return resolveGraduated(symbols, layer, *graduated);
+    }
+    // RasterSymbol on a vector layer is rejected by the caller before it gets
+    // here, so this is unreachable in practice.
+    return std::vector<std::uint32_t>(layer.features().size(), internSymbol(symbols, Symbol{}));
 }
 
 }  // namespace
@@ -182,7 +187,7 @@ Stylesheet::Stylesheet(const StyleSpec& spec, const Map& map) {
     for (const auto& [layerName, layerStyle] : spec.byLayerName) {
         const bool exists =
             std::any_of(map.layers().begin(), map.layers().end(),
-                         [&layerName](const MapLayer& l) { return l.layer().name() == layerName; });
+                         [&layerName](const MapLayer& l) { return l.name() == layerName; });
         if (!exists) {
             throw StyleError(std::format("style names layer '{}', which this map doesn't have (available: {})",
                                           layerName, joinLayerNames(map)));
@@ -192,11 +197,27 @@ Stylesheet::Stylesheet(const StyleSpec& spec, const Map& map) {
     const LayerStyle fallbackStyle = spec.defaultStyle.value_or(LayerStyle{SingleSymbol{}});
 
     symbolIndexByFeature_.reserve(map.layers().size());
+    rasterStyles_.reserve(map.layers().size());
     for (const MapLayer& mapLayer : map.layers()) {
-        const Layer& layer = mapLayer.layer();
-        const auto it = spec.byLayerName.find(layer.name());
+        const auto it = spec.byLayerName.find(mapLayer.name());
         const LayerStyle& style = it != spec.byLayerName.end() ? it->second : fallbackStyle;
-        symbolIndexByFeature_.push_back(resolveLayer(symbols_, layer, style));
+
+        if (mapLayer.isRaster()) {
+            // A raster has no features to resolve symbols for, so it keeps an
+            // empty row - symbolIndexByFeature_ stays one entry per layer so
+            // layerCount() and every layer index still line up.
+            symbolIndexByFeature_.emplace_back();
+            const auto* rasterStyle = std::get_if<RasterSymbol>(&style);
+            rasterStyles_.push_back(rasterStyle != nullptr ? rasterStyle->raster : raster::RasterStyle{});
+            continue;
+        }
+
+        if (std::holds_alternative<RasterSymbol>(style)) {
+            throw StyleError(std::format(
+                "layer '{}' is a vector layer, but its style has \"type\": \"raster\"", mapLayer.name()));
+        }
+        symbolIndexByFeature_.push_back(resolveLayer(symbols_, mapLayer.layer(), style));
+        rasterStyles_.emplace_back();
     }
 
     // A map with no layers would otherwise leave an empty symbol table;

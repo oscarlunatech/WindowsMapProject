@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "cartograph/feature.h"
+#include "cartograph/raster/raster_source.h"
 #include "cartograph/style/symbol.h"
 
 namespace cartograph::style {
@@ -47,7 +48,13 @@ struct Graduated {
     Symbol fallback;            // above the last break, null, or non-numeric
 };
 
-using LayerStyle = std::variant<SingleSymbol, Categorized, Graduated>;
+// How a raster layer is drawn. Wraps raster::RasterStyle rather than
+// redefining it, so the style file and the reader agree by construction.
+struct RasterSymbol {
+    raster::RasterStyle raster;
+};
+
+using LayerStyle = std::variant<SingleSymbol, Categorized, Graduated, RasterSymbol>;
 
 // A whole style file, still dataset-independent: layers are named rather than
 // indexed and field names haven't been resolved to field indices yet. Binding

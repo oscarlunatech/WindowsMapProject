@@ -20,6 +20,7 @@
 #include "cartograph/jobs/thread_pool.h"
 #include "cartograph/map.h"
 #include "cartograph/query/identify.h"
+#include "cartograph/raster/raster_source.h"
 #include "cartograph/render/renderer.h"
 #include "cartograph/style/stylesheet.h"
 #include "viewer.h"
@@ -117,13 +118,20 @@ int runDump(const std::vector<std::string>& paths, std::size_t limit) {
 // eventually show - bottom layer first, topmost last.
 int runLayers(const std::vector<std::string>& paths, const std::string& crs) {
     jobs::ThreadPool pool;
-    const Map map = Map::open(paths, crs, pool);
+    Map map = Map::open(paths, crs, pool);
 
     std::cout << std::format("{} layer(s), drawn bottom to top:\n", map.layers().size());
     for (std::size_t i = 0; i < map.layers().size(); ++i) {
         const MapLayer& mapLayer = map.layers()[i];
-        std::cout << std::format("  [{}] {}  features: {}  source: {}\n", i, mapLayer.layer().name(),
-                                  mapLayer.layer().features().size(), mapLayer.sourcePath());
+        if (mapLayer.isRaster()) {
+            const raster::RasterSource& source = *mapLayer.rasterSource();
+            std::cout << std::format("  [{}] {}  raster: {}x{}, {} band(s)  source: {}\n", i,
+                                      mapLayer.name(), source.width(), source.height(), source.bandCount(),
+                                      mapLayer.sourcePath());
+        } else {
+            std::cout << std::format("  [{}] {}  features: {}  source: {}\n", i, mapLayer.name(),
+                                      mapLayer.layer().features().size(), mapLayer.sourcePath());
+        }
     }
     return 0;
 }
@@ -150,7 +158,7 @@ int runIdentify(const std::vector<std::string>& paths, const std::string& crs, P
                 std::optional<double> toleranceOverride,
                 std::size_t limit) {
     jobs::ThreadPool pool;
-    const Map map = Map::open(paths, crs, pool);
+    Map map = Map::open(paths, crs, pool);
     const double tolerance = toleranceOverride ? *toleranceOverride : defaultTolerance(map.extent());
 
     const std::vector<query::Hit> hits = query::identify(map, at, tolerance);
@@ -164,7 +172,17 @@ int runIdentify(const std::vector<std::string>& paths, const std::string& crs, P
             std::cout << std::format("  ... and {} more (raise --limit to see them)\n", hits.size() - shown);
             break;
         }
-        const Layer& layer = map.layers()[hit.layerIndex].layer();
+        const MapLayer& mapLayer = map.layers()[hit.layerIndex];
+        if (hit.isRaster()) {
+            std::cout << std::format("  [{}] {}  (raster)\n", hit.layerIndex, mapLayer.name());
+            for (std::size_t b = 0; b < hit.bandValues.size(); ++b) {
+                std::cout << std::format("    band {}: {}\n", b + 1, hit.bandValues[b]);
+            }
+            ++shown;
+            continue;
+        }
+
+        const Layer& layer = mapLayer.layer();
         const Feature& feature = layer.features()[hit.featureIndex];
         std::cout << std::format("  [{}] {} feature {}  distance: {}\n", hit.layerIndex, layer.name(),
                                   feature.id(), hit.distance);
@@ -205,10 +223,16 @@ int runRender(const std::vector<std::string>& paths, const std::string& crs,
               const std::optional<Envelope>& bboxOverride,
               render::ScreenSize size, const std::string& outputPath, const std::string& stylePath) {
     jobs::ThreadPool pool;
-    const Map map = Map::open(paths, crs, pool);
+    Map map = Map::open(paths, crs, pool);
     const Envelope bbox = bboxOverride ? *bboxOverride : map.extent();
     const render::Viewport viewport(bbox, size);
-    const auto bitmap = render::Renderer::render(map, viewport, buildStylesheet(map, stylePath));
+    const style::Stylesheet stylesheet = buildStylesheet(map, stylePath);
+
+    // Raster layers hold no pixels until something asks for a window; a
+    // one-shot render does that inline, right before drawing.
+    render::refreshRasterLayers(map, viewport, stylesheet);
+
+    const auto bitmap = render::Renderer::render(map, viewport, stylesheet);
     render::savePng(bitmap.Get(), outputPath);
     return 0;
 }
@@ -259,7 +283,7 @@ int runBench(const std::vector<std::string>& paths, const std::string& crs, int 
     // stylesheet, which resolves every feature's symbol up front so the
     // per-frame path only does an array lookup.
     jobs::ThreadPool pool;
-    const Map map = Map::open(paths, crs, pool);
+    Map map = Map::open(paths, crs, pool);
     const style::Stylesheet stylesheet = buildStylesheet(map, stylePath);
     const std::vector<Envelope> cameraPath = buildCameraPath(map.extent(), frameCount, crs);
 
@@ -277,6 +301,11 @@ int runBench(const std::vector<std::string>& paths, const std::string& crs, int 
 
     for (int i = 0; i < frameCount; ++i) {
         const render::Viewport viewport(cameraPath[static_cast<std::size_t>(i)], size);
+
+        // Outside the timed section deliberately: this is file I/O, and the
+        // benchmark measures per-frame draw cost. In the live viewer the same
+        // read happens on a background thread for exactly that reason.
+        render::refreshRasterLayers(map, viewport, stylesheet);
 
         const auto start = std::chrono::high_resolution_clock::now();
         target.beginFrame();

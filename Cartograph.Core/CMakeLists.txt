@@ -4,12 +4,14 @@ find_package(nlohmann_json CONFIG REQUIRED)
 
 add_library(Cartograph.Core STATIC
     src/geometry.cpp
+    src/gdal_platform.cpp
     src/dataset.cpp
     src/map.cpp
     src/index/spatial_index.cpp
     src/geom/simplify.cpp
     src/geom/predicates.cpp
     src/query/identify.cpp
+    src/raster/raster_source.cpp
     src/render/viewport.cpp
     src/render/renderer.cpp
     src/render/layer_cache.cpp
@@ -22,6 +24,12 @@ add_library(Cartograph::Core ALIAS Cartograph.Core)
 
 target_include_directories(Cartograph.Core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+# src/ itself, so translation units in src/<module>/ can include the library's
+# internal headers (e.g. gdal_platform.h) by plain name rather than by a
+# relative path that depends on how deep they sit.
+target_include_directories(Cartograph.Core PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 target_compile_features(Cartograph.Core PUBLIC cxx_std_20)

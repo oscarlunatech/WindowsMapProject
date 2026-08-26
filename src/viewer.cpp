@@ -6,6 +6,8 @@
 
 #include <cstdio>
 #include <cwchar>
+#include <algorithm>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -18,6 +20,7 @@
 using cartograph::Envelope;
 using cartograph::Layer;
 using cartograph::Map;
+using cartograph::MapLayer;
 using cartograph::Point2D;
 using cartograph::render::RenderError;
 using cartograph::render::ScreenSize;
@@ -64,6 +67,13 @@ std::wstring formatAttribute(const cartograph::AttributeValue& value) {
         value);
 }
 constexpr UINT kMsgDatasetLoaded = WM_APP + 1;
+constexpr UINT kMsgRasterRead = WM_APP + 2;
+
+// How far the view has to move before a raster is worth re-reading. Without a
+// threshold every frame of a drag would queue a read; at 25% of the viewport
+// the existing image is still a good enough stand-in, since it's drawn by its
+// own extent and so stays correctly placed while it waits.
+constexpr double kRasterRereadFraction = 0.25;
 
 // Posted from loaderThread_ to the UI thread via PostMessageW/kMsgDatasetLoaded
 // (see Viewer::loadInBackground) - the only cross-thread handoff in Viewer,
@@ -76,6 +86,15 @@ struct LoadResult {
     Envelope extent;
     std::size_t featureCount = 0;
     std::wstring errorMessage;  // engaged only when map is nullopt
+};
+
+// Images produced on rasterThread_, handed to the UI thread through the
+// message queue. Same ownership rule as LoadResult: the worker builds it, the
+// UI thread takes ownership out of the message's LPARAM and is the only thing
+// that ever touches map_.
+struct RasterReadResult {
+    std::vector<std::pair<std::size_t, cartograph::raster::RasterImage>> images;
+    Envelope window;  // the view these were read for
 };
 
 std::wstring describePaths(const std::vector<std::string>& paths) {
@@ -97,6 +116,9 @@ Viewer::Viewer(std::vector<std::string> paths, std::string displayCrs, std::stri
 Viewer::~Viewer() {
     if (loaderThread_.joinable()) {
         loaderThread_.join();
+    }
+    if (rasterThread_.joinable()) {
+        rasterThread_.join();
     }
 }
 
@@ -216,6 +238,19 @@ LRESULT Viewer::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case WM_KEYDOWN:
             onKeyDown(wParam);
             return 0;
+        case kMsgRasterRead: {
+            std::unique_ptr<RasterReadResult> result(reinterpret_cast<RasterReadResult*>(lParam));
+            rasterReadInFlight_ = false;
+            if (map_) {
+                for (auto& [layerIndex, image] : result->images) {
+                    if (layerIndex < map_->layers().size() && map_->layers()[layerIndex].isRaster()) {
+                        map_->layers()[layerIndex].setImage(std::move(image));
+                    }
+                }
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         case kMsgDatasetLoaded: {
             std::unique_ptr<LoadResult> result(reinterpret_cast<LoadResult*>(lParam));
             if (result->map) {
@@ -224,6 +259,8 @@ LRESULT Viewer::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 totalFeatureCount_ = result->featureCount;
                 mapExtent_ = result->extent;
                 loadState_ = LoadState::Ready;
+                anyRasterLayers_ = std::any_of(map_->layers().begin(), map_->layers().end(),
+                                                [](const MapLayer& l) { return l.isRaster(); });
             } else {
                 loadState_ = LoadState::Failed;
                 loadMessage_ =
@@ -331,6 +368,12 @@ void Viewer::onPaint(HWND hwnd) {
     }
 
     EndPaint(hwnd, &ps);
+
+    // Checked after drawing, not before: the frame just painted used whatever
+    // pixels were already there, and this only queues work when the view has
+    // moved far enough to be worth re-reading.
+    maybeStartRasterRead(hwnd);
+
     InvalidateRect(hwnd, nullptr, FALSE);  // keep redrawing continuously
 }
 
@@ -365,6 +408,63 @@ void Viewer::onMouseMove(POINT clientPos) {
     mapExtent_.maxY += dy;
 
     lastMousePos_ = clientPos;
+}
+
+bool Viewer::rasterReadWorthwhile(const Envelope& current) const {
+    if (!rasterReadExtent_.valid) {
+        return true;  // nothing read yet
+    }
+    // Re-read once the view has shifted or resized by a meaningful fraction of
+    // itself. Comparing against the *current* size means zooming in triggers a
+    // read as readily as panning does, which is the point - zoom is where a
+    // stale image looks worst.
+    const double threshold = kRasterRereadFraction * (std::max)(current.width(), current.height());
+    return std::abs(current.minX - rasterReadExtent_.minX) > threshold ||
+           std::abs(current.maxX - rasterReadExtent_.maxX) > threshold ||
+           std::abs(current.minY - rasterReadExtent_.minY) > threshold ||
+           std::abs(current.maxY - rasterReadExtent_.maxY) > threshold;
+}
+
+void Viewer::maybeStartRasterRead(HWND hwnd) {
+    if (!anyRasterLayers_ || rasterReadInFlight_ || loadState_ != LoadState::Ready) {
+        return;
+    }
+    const Viewport viewport = currentViewport();
+    if (!rasterReadWorthwhile(viewport.mapExtent())) {
+        return;
+    }
+
+    if (rasterThread_.joinable()) {
+        rasterThread_.join();  // the previous one has already posted its result
+    }
+    rasterReadInFlight_ = true;
+    rasterReadExtent_ = viewport.mapExtent();
+    rasterThread_ = std::thread(&Viewer::readRastersInBackground, this, hwnd, viewport.mapExtent(),
+                                 viewport.screenSize());
+}
+
+void Viewer::readRastersInBackground(HWND hwnd, Envelope window, ScreenSize size) {
+    auto result = std::make_unique<RasterReadResult>();
+    result->window = window;
+    try {
+        // Only the RasterSources (shared_ptr, and internally mutex-guarded)
+        // and the styles are touched here - never map_ itself, which stays
+        // the UI thread's alone.
+        for (std::size_t i = 0; i < map_->layers().size(); ++i) {
+            const MapLayer& mapLayer = map_->layers()[i];
+            if (!mapLayer.isRaster() || !mapLayer.visible()) {
+                continue;
+            }
+            result->images.emplace_back(
+                i, mapLayer.rasterSource()->read(window, size.width, size.height,
+                                                  stylesheet_->rasterStyle(i)));
+        }
+    } catch (const std::exception&) {
+        // A failed read just leaves the previous image in place; the overlay
+        // would be the wrong place to report it and the next read may succeed.
+        result->images.clear();
+    }
+    PostMessageW(hwnd, kMsgRasterRead, 0, reinterpret_cast<LPARAM>(result.release()));
 }
 
 void Viewer::onClick(POINT clientPos) {

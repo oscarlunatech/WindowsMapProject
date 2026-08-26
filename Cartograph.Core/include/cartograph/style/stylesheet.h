@@ -56,6 +56,12 @@ public:
     // Dataset and a Stylesheet separately can check they still belong together.
     std::size_t layerCount() const { return symbolIndexByFeature_.size(); }
 
+    // How a raster layer is drawn. Vector layers get a default-constructed
+    // RasterStyle that nothing reads; asking is always safe.
+    const raster::RasterStyle& rasterStyle(std::size_t layerIndex) const {
+        return rasterStyles_[layerIndex];
+    }
+
     // Index into symbols() for one feature. layerIndex and featureIndex are
     // positions in Dataset::layers() and Layer::features() respectively.
     std::size_t symbolIndex(std::size_t layerIndex, std::size_t featureIndex) const {
@@ -65,6 +71,7 @@ public:
 private:
     std::vector<Symbol> symbols_;
     std::vector<std::vector<std::uint32_t>> symbolIndexByFeature_;  // [layer][feature] -> symbols_ index
+    std::vector<raster::RasterStyle> rasterStyles_;                 // [layer]; unused for vector layers
 };
 
 }  // namespace cartograph::style

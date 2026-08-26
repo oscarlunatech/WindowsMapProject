@@ -2,7 +2,7 @@
 
 A fast, correct desktop GIS for Windows. C++ core, WPF shell.
 
-Status: **Phase 10 (display CRS) complete** — 10 of 21 phases to 1.0. See [DECISIONS.md](DECISIONS.md) and [BENCHMARKS.md](BENCHMARKS.md) for the running log.
+Status: **Phase 11 (raster) complete** — 11 of 21 phases to 1.0. See [DECISIONS.md](DECISIONS.md) and [BENCHMARKS.md](BENCHMARKS.md) for the running log.
 
 ## Design goals
 
@@ -128,15 +128,53 @@ cartograph_cli render Cartograph.Core/tests/fixtures/ne_110m_admin_0_countries.s
     --style styles/countries-by-continent.json -o continents.png
 ```
 
+## Rasters
+
+Raster files are opened exactly like vector ones — same commands, same layer stack, no flag saying which is which. So a shaded-relief basemap under vector borders is just two paths in the right order:
+
+```
+cartograph_cli view hillshade.tif borders.shp
+```
+
+Rasters are warped into the display CRS on open, so they line up with vector layers, and the visible window is **re-read at screen resolution whenever the view moves** — so they stay sharp at every zoom rather than blurring out of one load-time bitmap. In the live viewer that read happens on a background thread; the previous image keeps drawing, correctly positioned, until the new one lands. Clicking a raster reports the raw value of every band under the cursor.
+
+A `raster` style controls bands and contrast:
+
+```json
+{
+  "layers": {
+    "landsat": {
+      "type": "raster",
+      "bands": [4, 3, 2],
+      "stretch": "percentile",
+      "stretchRange": [2, 98]
+    }
+  }
+}
+```
+
+- **`bands`** — 1-based, either three (red, green, blue) or one (grayscale). Omit for automatic: three or more bands take the first three, a single band renders as gray.
+- **`stretch`** — `auto` (default), `none`, `minmax` or `percentile`, with `stretchRange` setting the percentile cuts. Contrast is computed from the pixels actually on screen, so zooming into a dark corner brings out its detail.
+
+`auto` asks the file what it is: an 8-bit image whose bands are tagged red/green/blue is already display-ready and is left alone, while anything else (a DEM, 16-bit satellite bands) gets a percentile stretch. That distinction is worth knowing about — percentile-stretching a finished RGB basemap visibly oversaturates it, and a DEM is invisible without a stretch, so no single default is right for both.
+
+[`styles/natural-earth-basemap.json`](styles/natural-earth-basemap.json) is a worked example. Fetch the raster it expects with `scripts/fetch-raster.ps1`, then:
+
+```
+cartograph_cli view data/raster/NE1_50M_SR_W/NE1_50M_SR_W.tif \
+    Cartograph.Core/tests/fixtures/ne_110m_admin_0_countries.shp \
+    --style styles/natural-earth-basemap.json
+```
+
 ## Roadmap
 
-Built in ordered phases; each is buildable and tested before the next starts. **10 of 21 phases done.** The authoritative per-phase plan — scope, ordering constraints, and how thin each pillar's 1.0 slice is — lives in [CLAUDE.md](CLAUDE.md), so it stays in one place rather than drifting between two.
+Built in ordered phases; each is buildable and tested before the next starts. **11 of 21 phases done.** The authoritative per-phase plan — scope, ordering constraints, and how thin each pillar's 1.0 slice is — lives in [CLAUDE.md](CLAUDE.md), so it stays in one place rather than drifting between two.
 
 | Phases | | |
 |---|---|---|
 | 1–7 | **Foundations** — data model, rendering, live window, performance, threading, reprojection, symbology | done |
-| 8–11 | **A real map model** — identify ✓, multi-layer ✓, display CRS ✓, then raster display | in progress |
-| 12–14 | **The shell** — C++/CLI interop, then WPF: map surface, layer list, identify panel, attribute table | |
+| 8–11 | **A real map model** — identify, multi-layer, display CRS, raster display | done |
+| 12–14 | **The shell** — C++/CLI interop, then WPF: map surface, layer list, identify panel, attribute table | next |
 | 15–18 | **Cartography and editing** — labels, a mutable data model, digitizing, persistence | |
 | 19–21 | **Analysis and output** — GEOS toolbox, XYZ basemaps, print/export | |
 
@@ -147,6 +185,8 @@ The shell deliberately lands at 12, not 8: the model still has to grow multi-lay
 | Tier | What | Where |
 |---|---|---|
 | Fixture | Natural Earth 110m countries (~177 features) | committed, `Cartograph.Core/tests/fixtures/` |
+| Fixture | Synthetic GeoTIFFs for the raster tests | generated in-process, never written to the repo |
+| Raster | Natural Earth 50m shaded relief (~167MB) | gitignored, `scripts/fetch-raster.ps1` → `data/raster/` |
 | Benchmark | NJ TIGER/Line roads, 21 counties (189,314 features) | gitignored, `scripts/fetch-data.ps1` → `data/nj-roads/` |
 
 Fixture data is small enough to commit and is what the golden-image test compares against. Benchmark data is never committed — rerun the fetch script on a fresh clone.
