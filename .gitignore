@@ -2,6 +2,15 @@ build/
 out/
 data/
 bench_*.csv
+
+# MSBuild intermediates for the managed projects. Their outputs go to
+# build/managed/ (already covered above), but the C# SDK insists on putting
+# obj/ beside the project file wherever the output is pointed.
+obj/
+bin/
+*.vcxproj.user
+*.csproj.user
+
 .vs/
 .vscode/*
 !.vscode/settings.json

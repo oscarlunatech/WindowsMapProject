@@ -56,6 +56,16 @@ public:
     // Dataset and a Stylesheet separately can check they still belong together.
     std::size_t layerCount() const { return symbolIndexByFeature_.size(); }
 
+    // How many features layerIndex's row of the table was built for (0 for a
+    // raster layer, which has none). symbolIndex() below deliberately does not
+    // bounds-check, because it is the renderer's per-feature per-frame lookup;
+    // this exists so a caller that cannot be trusted to index correctly - i.e.
+    // anything reaching in from outside C++, such as Cartograph.Interop - can
+    // check first rather than read past the end of the row.
+    std::size_t featureCount(std::size_t layerIndex) const {
+        return symbolIndexByFeature_[layerIndex].size();
+    }
+
     // How a raster layer is drawn. Vector layers get a default-constructed
     // RasterStyle that nothing reads; asking is always safe.
     const raster::RasterStyle& rasterStyle(std::size_t layerIndex) const {

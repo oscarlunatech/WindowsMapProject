@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cartograph.Interop - the C++/CLI marshalling boundary (Phase 12).
+
+  Built by MSBuild rather than CMake. CMake's COMMON_LANGUAGE_RUNTIME property
+  is only evaluated by the Visual Studio generators and every preset in
+  CMakePresets.json is Ninja, and CMake cannot build the Phase 13 WPF shell at
+  all - so the managed half of the tree is MSBuild's. See the Phase 12
+  DECISIONS entry.
+
+  It links against the native library CMake already built. The include paths
+  and the link line are NOT repeated here: they are imported from
+  cartograph-native.props, which the CMake configure step generates into the
+  build directory from the real target graph. Point CartographBuildDir at a
+  different build directory to link a different configuration.
+
+  Build it from a Developer PowerShell for VS, once the native x64-debug preset
+  has been built, with:
+
+      msbuild Cartograph.Interop\Cartograph.Interop.vcxproj -p:Configuration=Debug -p:Platform=x64
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <ProjectGuid>{7C2E1B4A-8D53-4F1E-9A6C-3B5D0E7F2A11}</ProjectGuid>
+    <RootNamespace>CartographInterop</RootNamespace>
+    <Keyword>ManagedCProj</Keyword>
+    <!-- WPF (Phase 13) needs the Windows Desktop framework; the shell picks
+         that up from its own .csproj. This assembly itself needs only the base
+         framework, but the two must agree on the version. -->
+    <TargetFramework>net10.0-windows</TargetFramework>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <!-- VS 2026's toolset. Stated rather than defaulted: with no value here
+         Microsoft.Cpp.Default.props falls back to v100 and the build fails
+         asking for Visual Studio 2010. -->
+    <PlatformToolset Condition="'$(PlatformToolset)' == ''">v145</PlatformToolset>
+    <CLRSupport>NetCore</CLRSupport>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries Condition="'$(Configuration)' == 'Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)' != 'Debug'">false</UseDebugLibraries>
+    <!-- /clr and /GL are incompatible; whole-program optimisation must stay off
+         even in Release. -->
+    <WholeProgramOptimization>false</WholeProgramOptimization>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <!-- Where CMake put the native build this links against. Mirrors the preset
+       layout in CMakePresets.json (build/x64-debug, build/x64-release); can be
+       overridden on the command line. -->
+  <PropertyGroup>
+    <CartographBuildDir Condition="'$(CartographBuildDir)' == ''">$(MSBuildThisFileDirectory)..\build\x64-$(Configuration.ToLowerInvariant())</CartographBuildDir>
+    <CartographNativeProps>$(CartographBuildDir)\cartograph-native.props</CartographNativeProps>
+
+    <!-- Managed output lives beside the native build rather than inside it, so
+         a CMake build never trips over MSBuild's intermediates and a clean of
+         either leaves the other alone. -->
+    <OutDir>$(MSBuildThisFileDirectory)..\build\managed\x64-$(Configuration.ToLowerInvariant())\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)..\build\managed\obj\$(MSBuildProjectName)\x64-$(Configuration.ToLowerInvariant())\</IntDir>
+  </PropertyGroup>
+
+  <Import Project="$(CartographNativeProps)" Condition="Exists('$(CartographNativeProps)')" />
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+      <WarningLevel>Level3</WarningLevel>
+      <!-- /clr requires /EHa; the /EHsc default would fail the build outright. -->
+      <ExceptionHandling>Async</ExceptionHandling>
+      <!-- /RTC1 (the usual Debug default) is rejected outright alongside /clr:
+           "command-line options are incompatible". Same story for Just My Code
+           (/JMC) and Edit-and-Continue debug info (/ZI), so all three are
+           pinned rather than left to the configuration defaults. -->
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+      <SupportJustMyCodeDebugging>false</SupportJustMyCodeDebugging>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <!-- /clr needs the DLL CRT; the static ones are not an option here. -->
+      <RuntimeLibrary Condition="'$(Configuration)' == 'Debug'">MultiThreadedDebugDLL</RuntimeLibrary>
+      <RuntimeLibrary Condition="'$(Configuration)' != 'Debug'">MultiThreadedDLL</RuntimeLibrary>
+      <Optimization Condition="'$(Configuration)' == 'Debug'">Disabled</Optimization>
+      <Optimization Condition="'$(Configuration)' != 'Debug'">MaxSpeed</Optimization>
+      <!-- NOMINMAX for the reason recorded in the Phase 5 DECISIONS entry:
+           Core's headers reach windows.h through d2d1.h, and its function-like
+           min/max macros mangle any std::min/std::max that is not
+           parenthesised. Defining it out is simpler than remembering. -->
+      <PreprocessorDefinitions>NOMINMAX;WIN32_LEAN_AND_MEAN;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClInclude Include="conversions.h" />
+    <ClInclude Include="errors.h" />
+    <ClInclude Include="geometry.h" />
+    <ClInclude Include="map.h" />
+    <ClInclude Include="query.h" />
+    <ClInclude Include="render_bridge.h" />
+    <ClInclude Include="renderer.h" />
+    <ClInclude Include="stylesheet.h" />
+    <ClInclude Include="types.h" />
+    <ClInclude Include="viewport.h" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClCompile Include="conversions.cpp" />
+    <ClCompile Include="geometry.cpp" />
+    <ClCompile Include="map.cpp" />
+    <ClCompile Include="query.cpp" />
+    <!-- The one native translation unit: it is the only file allowed to include
+         Core's render/renderer.h, which pulls in <wrl/client.h> and so cannot
+         be compiled with /clr. See the header for the full explanation. -->
+    <ClCompile Include="render_bridge.cpp">
+      <CompileAsManaged>false</CompileAsManaged>
+    </ClCompile>
+    <ClCompile Include="renderer.cpp" />
+    <ClCompile Include="stylesheet.cpp" />
+    <ClCompile Include="viewport.cpp" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+  <!-- Without this the failure is a wall of "cannot open include file
+       'cartograph/map.h'", which says nothing about the actual cause. -->
+  <Target Name="CartographRequireNativeBuild" BeforeTargets="ClCompile">
+    <Error Condition="!Exists('$(CartographNativeProps)')"
+           Text="Native build not found: $(CartographNativeProps) is missing. Configure and build the native tree first, e.g. `cmake --preset x64-debug &amp;&amp; cmake --build --preset x64-debug`, or set CartographBuildDir to a build directory that has one." />
+  </Target>
+
+  <!-- vcpkg's applocal deployment already worked out GDAL/PROJ/GEOS's whole
+       transitive DLL closure into the native build directory, and CMake copied
+       proj.db in beside it (PROJ needs that file at runtime for every
+       transform). Copy the result rather than recomputing it. -->
+  <Target Name="CartographCopyNativeRuntime" AfterTargets="Build"
+          Condition="'$(CartographNativeBinDir)' != ''">
+    <ItemGroup>
+      <CartographRuntimeFile Include="$(CartographNativeBinDir)\*.dll" />
+      <CartographRuntimeFile Include="$(CartographNativeBinDir)\proj.db" />
+    </ItemGroup>
+    <Copy SourceFiles="@(CartographRuntimeFile)"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>

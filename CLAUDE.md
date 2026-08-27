@@ -10,7 +10,7 @@ Cartograph: a fast, correct desktop GIS for Windows (C++ core, eventual WPF shel
 
 ## Current state and the plan to 1.0
 
-**Done: phases 1–11. Next: Phase 12 (`Cartograph.Interop`).**
+**Done: phases 1–12. Next: Phase 13 (WPF shell I).**
 
 Work happens in ordered phases, and **skipping ahead defeats the point** — each phase is buildable, tested and green before the next starts. If a phase looks like it needs something from a later one, that's a signal to re-scope with the user, not to quietly pull the later work forward.
 
@@ -31,8 +31,8 @@ Work happens in ordered phases, and **skipping ahead defeats the point** — eac
 | **9** | Multi-layer map model — `Map`/`MapLayer`, N files stacked, visibility/opacity; `drawDataset*` became `drawMap*` | done |
 | **10** | Display CRS — `--crs`, EPSG:3857 default, `Map::setDisplayCrs`, area-of-use clamping in `crs::Transformer` | done |
 | **11** | Raster — `raster::RasterSource`, warped display, band selection + stretch, re-read on view change, raster identify | done |
-| **12** | **`Cartograph.Interop`** — C++/CLI marshalling boundary, no logic | next |
-| **13** | WPF shell I — window, hosted D2D map surface, layer list, toolbar | |
+| **12** | `Cartograph.Interop` — C++/CLI marshalling boundary, no logic | done |
+| **13** | **WPF shell I** — window, hosted D2D map surface, layer list, toolbar | next |
 | **14** | WPF shell II — identify panel, attribute table, selection, symbology editor | |
 | **15** | Labels — DirectWrite, placement rules, collision avoidance. Deferred out of Phase 7 deliberately | |
 | **16** | Mutable data model — feature mutation + cache invalidation. **Prerequisite for 17** (see constraints) | |
@@ -92,13 +92,29 @@ build\x64-debug\Cartograph.Core\tests\cartograph_core_tests.exe "Envelope expand
 
 Run the CLI: `build\x64-debug\cartograph_cli.exe {info|dump|layers|identify|render|view|bench} <path>... ...` — every command takes one or more dataset paths (they stack as layers, first path at the bottom), then flags. See README's Usage section.
 
+### The managed half (Phase 12 onward)
+
+**CMake owns the native tree; MSBuild owns the managed one, and there is an order between them.** CMake's `COMMON_LANGUAGE_RUNTIME` is only evaluated by the Visual Studio generators (every preset here is Ninja), and CMake cannot build a WPF project at all — so `Cartograph.Interop` and, from Phase 13, the shell are MSBuild's. See the Phase 12 `DECISIONS.md` entry.
+
+```powershell
+cmake --build --preset x64-debug     # must come first: produces Core.lib AND cartograph-native.props
+scripts\build-managed.ps1            # builds Interop + tests, then runs the tests
+scripts\build-managed.ps1 -Configuration Release
+```
+
+`cartograph-native.props` is **generated** into each build directory by `file(GENERATE)` in the top-level `CMakeLists.txt`, carrying the include paths and the real link line (Debug links `gdald.lib`/`proj_d.lib`, Release `gdal.lib`/`proj.lib`) plus `CartographNativeBinDir`. Never hand-write that link line into the `.vcxproj` — that is the whole point of generating it. Managed output goes to `build\managed\x64-{debug,release}\`, which the `.vcxproj` populates with the native DLL closure and `proj.db` copied from the CLI's output directory.
+
+Traps that cost time once already, all recorded in the Phase 12 DECISIONS entry: `<wrl/client.h>` **cannot be compiled under `/clr`** (a Windows SDK `#error`), which is why `render_bridge.cpp` exists and is the only file here compiled unmanaged; `/clr` is incompatible with `/RTC1`, `/JMC`, `/ZI` and `/GL`, all configuration defaults, so all four are pinned off in the `.vcxproj`; without `VCProjectVersion`/`PlatformToolset` the toolset defaults to v100 and the build demands Visual Studio 2010; and `vswhere -requires Microsoft.VisualStudio.Component.VC.CLI.Support` returns nothing on this machine even though `/clr:netcore` works fine — do not trust it.
+
 **Benchmark (and, for real perf-sensitive interactive use, run `view`) via the `x64-release` preset**, not `x64-debug`: `cmake --preset x64-release && cmake --build --preset x64-release`, binaries land in `build\x64-release\`. Since Phase 5 (threading), Debug numbers no longer reflect real per-frame cost — a naive thread pool's per-task synchronization overhead (heap-allocated tasks, mutex/condvar) is disproportionate to the work in an unoptimized (`/Od`, `/RTC1`, debug CRT) build; see the Phase 5 `DECISIONS.md`/`BENCHMARKS.md` entries. `x64-debug` remains correct for day-to-day development and is what the test suite above should keep running against.
 
 ## Architecture
 
-**Two-target split, enforced deliberately:**
+**Target split, enforced deliberately:**
 - `Cartograph.Core` (static lib, `Cartograph.Core/`) — all GDAL/OGR/GEOS/PROJ/Direct2D/WIC usage lives here. Must compile and be fully testable with no window, no HWND, no message loop. This is why Phases 1–2 (data model, off-screen rendering) were buildable and testable before Phase 3 (live window) existed at all.
 - `cartograph_cli` (executable, `src/`) — the only place `HWND`, `WNDCLASSEXW`, and the Win32 message loop appear (`src/viewer.h/.cpp`). Win32 UI code must never leak into `Cartograph.Core`.
+- `Cartograph.Interop` (C++/CLI assembly, `Cartograph.Interop/`, added Phase 12) — the marshalling boundary to .NET. **No logic**: every member forwards to Core. Built by MSBuild, not CMake — see the build section below.
+- `Cartograph.Interop.Tests` (C# console, `Cartograph.Interop.Tests/`) — the boundary's test suite, hand-rolled asserts with no NuGet dependency.
 
 **Data flow through Core**, in the order a new dataset moves through the code:
 0. `Map` / `MapLayer` (`cartograph/map.h`, added Phase 9) is what actually gets drawn, styled and identified against. `Map::open(paths)` opens each path via `Dataset::open` and appends its layers, so a map is an **ordered stack drawn bottom-to-top** — `layers()[0]` is underneath, the last entry on top. Each `MapLayer` bundles the `Layer`, the `render::LayerCache` derived from it, the source path, and per-map display state (`visible()`, `opacity()`). The cache lives *in* the MapLayer rather than in a parallel vector because the two are invalidated by the same events — which is what Phase 16 will need. Styling deliberately does not live there (a `Stylesheet` binds to the whole Map), so restyling never touches an R-tree. `Dataset` is now purely the loader: it still owns the GDAL boundary and the reprojection, and `takeLayers()` moves its layers into a Map. Metadata-only commands (`info`, `dump`) still use `Dataset` directly, since building a Map also builds every R-tree and simplification bucket — a lot of work just to print a field list. Since Phase 10 a Map also owns a **display CRS** (`displayCrs()`, default `EPSG:3857`): every layer is reprojected into it at load, and `setDisplayCrs()` switches it by **re-reading every source file** rather than transforming already-projected geometry — that avoids both accumulating error across repeated switches and doubling memory to keep a pristine source copy. It's strongly exception-safe and preserves per-layer visibility/opacity. `Map` remembers the paths it was opened with (duplicates included) rather than deriving them from its layers, because loading the same file twice on purpose is legitimate.
@@ -120,11 +136,25 @@ Run the CLI: `build\x64-debug\cartograph_cli.exe {info|dump|layers|identify|rend
 
     Two traps recorded in the Phase 11 DECISIONS entry: **`GDALAutoCreateWarpedVRT` reproduces the Phase 10 pole bug and worse** (it derives its own output extent, so a global raster warps to a 12×-too-tall grid at a tenth of the resolution) — `createWarpedVrt` computes the grid through `crs::Transformer` instead, and `GDALCreateWarpedVRT` unlike the Auto variant needs its band lists filled in by hand. And **`StretchMode::Automatic` is the default for a reason**: percentile-stretching an 8-bit RGB basemap visibly oversaturates it, while a DEM is invisible without a stretch, so the mode is resolved per file from band type and colour interpretation.
 
+11. `Cartograph.Interop` (added Phase 12) is the C++/CLI wrapper the WPF shell will talk to, and it is **marshalling only** — if a member does anything but convert and forward, it is in the wrong assembly. `Map`/`MapLayer`/`Geometry`/`Viewport`/`Stylesheet`/`JobPool` are ref classes owning a native pointer (`~T`/`!T` for Dispose and finalize); `MapPoint`/`Envelope`/`Symbol`/`IdentifyHit` and friends are value structs copied across. Four things about it are load-bearing:
+
+    **A `MapLayer` is a handle (owning `Map` + index), never a native pointer.** `Map::setDisplayCrs` replaces every layer wholesale, so a pointer would dangle across it; an index re-resolves and gets bounds-checked on every access. Keep it that way — Phase 16 needs the same property.
+
+    **Every public entry point translates exceptions** via the `CARTOGRAPH_TRY`/`CARTOGRAPH_CATCH` macros in `errors.h`. A native exception unwinding into managed code kills the process; there is no partial failure. The managed hierarchy mirrors Core's five error types one-for-one so the shell can branch on type rather than on message text.
+
+    **Strings cross as UTF-8 in both directions**, spelled out in `conversions.h` rather than using `marshal_as<std::string>`, which encodes with the process ANSI code page and mangles every non-ASCII path and attribute value.
+
+    **`render_bridge.cpp` is compiled unmanaged and is the only file that may include `cartograph/render/renderer.h`**, because that header pulls in `<wrl/client.h>`, which the Windows SDK `#error`s out under `/clr`. Core is not restructured to accommodate this; the shim is. Only the one-shot render path is exposed — `drawMapCulled` needs a live `ID2D1HwndRenderTarget` and belongs with Phase 13's hosted surface.
+
 **Error handling convention**: exceptions at system boundaries (file I/O, COM/D2D/WIC failures, CLI argument parsing), not error codes — `DatasetOpenError`, `RenderError` and `StyleError` all derive from `std::runtime_error`; `main()` catches `const std::exception&` once at the top rather than per exception type.
 
 ## Testing
 
-Catch2, `Cartograph.Core/tests/`. Two things worth knowing before adding tests:
+**Two suites, and both are the gate.** Catch2 for native (`ctest --preset x64-debug`), and the C# boundary suite for the managed side (`scripts\build-managed.ps1`, which builds and then runs it). Still no CI, so "green locally on both" is all there is.
+
+The managed suite (`Cartograph.Interop.Tests/Program.cs`) tests the *boundary*, not Core — Core's behavior belongs in Catch2 tests where it is cheaper to run. What it pins is what only C# can observe: that exceptions arrive typed instead of killing the process, that UTF-8 survives both directions, that a layer handle stays valid across `SetDisplayCrs`, that bad indices throw instead of reading past a vector, and that disposal is observable. It is deliberately dependency-free (no xunit, no restore) so a fresh clone with no network can still run it. It opens the fixture in `EPSG:4326` explicitly, for the reason in constraint 2 above.
+
+Catch2 details, `Cartograph.Core/tests/`. Two things worth knowing before adding tests:
 - `test_render.cpp` does a **byte-exact** pixel comparison against a committed golden PNG (`tests/fixtures/golden/countries_world.png`), relying on the forced software rasterizer for determinism. See the DECISIONS.md entry on this — it's an accepted risk (unverified across machines/CI), not an oversight, so don't "fix" apparent flakiness here by loosening it without updating that entry. Its second test covers `drawMapCulled` (which the golden image doesn't touch) by counting exact-colored pixels rather than comparing whole images — that's the only coverage of symbology surviving the fast path's per-symbol batching.
 - Fixture data (`tests/fixtures/ne_110m_admin_0_countries.*`) is Natural Earth 110m data, small enough to commit directly (per README's test-data tier table). Larger benchmarking datasets must never be committed: `scripts/fetch-data.ps1` downloads NJ TIGER/Line roads (21 counties) into gitignored `data/nj-roads/` — rerun it rather than expecting that data to already be present on a fresh clone.
 

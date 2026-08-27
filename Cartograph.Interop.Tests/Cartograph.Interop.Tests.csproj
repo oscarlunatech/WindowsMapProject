@@ -1,0 +1,67 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The managed half of the test suite: it exercises Cartograph.Interop's
+    boundary from C#, which is the only way to check that the marshalling
+    actually works from the language the shell is written in.
+
+    Deliberately **no NuGet dependencies** - not xunit, not NUnit. There is no
+    CI in this project (see CLAUDE.md), so a test suite that needs a package
+    restore is a test suite that fails on a fresh clone with no network for
+    reasons that have nothing to do with the code. The assert harness in
+    Program.cs is about thirty lines and needs no restore at all.
+
+    Build and run it from a Developer PowerShell for VS, after the native tree
+    and Cartograph.Interop:
+
+        msbuild Cartograph.Interop.Tests\Cartograph.Interop.Tests.csproj -p:Configuration=Debug -p:Platform=x64
+        build\managed\x64-debug\Cartograph.Interop.Tests.exe
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <AssemblyName>Cartograph.Interop.Tests</AssemblyName>
+    <RootNamespace>Cartograph.Interop.Tests</RootNamespace>
+
+    <!-- Output beside Cartograph.Interop rather than into a bin/ of its own:
+         that directory already holds the interop assembly, Ijwhost.dll, the
+         whole GDAL/PROJ DLL closure and proj.db, so the test exe finds its
+         entire runtime by being in it. -->
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+    <OutputPath>$(MSBuildThisFileDirectory)..\build\managed\x64-$(Configuration.ToLowerInvariant())\</OutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- A plain reference to the built assembly rather than a ProjectReference
+         to the .vcxproj. A C# SDK project referencing a C++ project has to
+         agree with it about platform names ("x64" vs "AnyCPU") and drags the
+         VC targets into every restore; pointing at the output keeps the two
+         builds independent, at the cost of having to build them in order. The
+         target below makes that order explicit rather than mysterious.
+
+         Private (copy-local) must stay **true** even though the assembly
+         already sits in this project's output directory. It is not about
+         copying: a reference marked Private=false is left out of
+         Cartograph.Interop.Tests.deps.json, and a .NET app resolves its
+         assemblies through that file rather than by probing the folder they
+         are sitting in - so the test would build cleanly and then die at
+         startup with "Could not load file or assembly 'Cartograph.Interop'".
+         The copy itself is a no-op that MSBuild skips as unchanged. -->
+    <Reference Include="Cartograph.Interop">
+      <HintPath>$(OutputPath)Cartograph.Interop.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="CartographRequireInterop" BeforeTargets="ResolveAssemblyReferences">
+    <Error Condition="!Exists('$(OutputPath)Cartograph.Interop.dll')"
+           Text="Cartograph.Interop.dll not found in $(OutputPath). Build Cartograph.Interop\Cartograph.Interop.vcxproj for this configuration first." />
+  </Target>
+
+</Project>
